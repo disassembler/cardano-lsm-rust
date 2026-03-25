@@ -8,7 +8,6 @@
 //!
 //! ```rust
 //! use cardano_lsm::{LsmTree, LsmConfig, Key, Value};
-//! use std::path::Path;
 //!
 //! # fn main() -> cardano_lsm::Result<()> {
 //! # let temp_dir = tempfile::tempdir()?;
@@ -20,7 +19,7 @@
 //! // Insert key-value pairs
 //! let key = Key::from(b"utxo_123");
 //! let value = Value::from(b"transaction_data");
-//! tree.insert(key.clone(), value)?;
+//! tree.insert(&key, &value)?;
 //!
 //! // Retrieve values
 //! if let Some(v) = tree.get(&key)? {
@@ -28,7 +27,7 @@
 //! }
 //!
 //! // Delete keys
-//! tree.delete(key)?;
+//! tree.delete(&key)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -51,11 +50,11 @@
 //! let snapshot = tree.snapshot();
 //!
 //! // Process block transactions
-//! tree.insert(Key::from(b"utxo_new"), Value::from(b"data"))?;
-//! tree.delete(Key::from(b"utxo_spent"))?;
+//! tree.insert(&Key::from(b"utxo_new"), &Value::from(b"data"))?;
+//! tree.delete(&Key::from(b"utxo_spent"))?;
 //!
 //! // If block is invalid or reorg occurs, rollback
-//! tree.rollback(&snapshot)?;
+//! tree.rollback(snapshot)?;
 //! // Tree is now back to the snapshot state
 //! # Ok(())
 //! # }
@@ -72,12 +71,12 @@
 //! # let db_path = temp_dir.path();
 //! # let config = LsmConfig::default();
 //! # let mut tree = LsmTree::open(db_path, config)?;
-//! # tree.insert(Key::from(b"addr_123_utxo_1"), Value::from(b"data1"))?;
-//! # tree.insert(Key::from(b"addr_123_utxo_2"), Value::from(b"data2"))?;
+//! # tree.insert(&Key::from(b"addr_123_utxo_1"), &Value::from(b"data1"))?;
+//! # tree.insert(&Key::from(b"addr_123_utxo_2"), &Value::from(b"data2"))?;
 //! let start = Key::from(b"addr_123_");
 //! let end = Key::from(b"addr_124_");
 //!
-//! for (key, value) in tree.range(start..end)? {
+//! for (key, value) in tree.range(&start, &end) {
 //!     // Process each key-value pair in range
 //!     println!("Key: {:?}, Value: {:?}", key, value);
 //! }
@@ -96,12 +95,14 @@
 //! # let db_path = temp_dir.path();
 //! # let config = LsmConfig::default();
 //! # let mut tree = LsmTree::open(db_path, config)?;
-//! let mut batch = Vec::new();
-//! batch.push((Key::from(b"key1"), Some(Value::from(b"value1"))));
-//! batch.push((Key::from(b"key2"), Some(Value::from(b"value2"))));
-//! batch.push((Key::from(b"key3"), None)); // Deletion
-//!
+//! let batch = vec![
+//!     (Key::from(b"key1"), Value::from(b"value1")),
+//!     (Key::from(b"key2"), Value::from(b"value2")),
+//! ];
 //! tree.insert_batch(batch)?;
+//!
+//! // Deletions are done separately
+//! tree.delete(&Key::from(b"key3"))?;
 //! # Ok(())
 //! # }
 //! ```
@@ -111,15 +112,11 @@
 //! Customize the LSM tree behavior with [`LsmConfig`]:
 //!
 //! ```rust
-//! use cardano_lsm::{LsmConfig, BloomFilterPolicy, CompactionStrategy};
+//! use cardano_lsm::LsmConfig;
 //!
 //! let config = LsmConfig {
 //!     memtable_size: 16 * 1024 * 1024,  // 16 MB memtable
-//!     num_levels: 7,                     // 7 levels for leveled compaction
-//!     level_size_multiplier: 10,         // Each level 10x larger than previous
-//!     compaction_strategy: CompactionStrategy::LazyLevelling,
-//!     bloom_filter: BloomFilterPolicy::default(),
-//!     use_compression: true,
+//!     bloom_filter_bits_per_key: 12,     // Bits per key for bloom filter
 //!     ..Default::default()
 //! };
 //! ```
@@ -135,11 +132,12 @@
 //! # let db_path = temp_dir.path();
 //! # let config = LsmConfig::default();
 //! # let mut tree = LsmTree::open(db_path, config)?;
-//! // Save current state
-//! tree.save_snapshot("block_12345")?;
+//! // Save current state to disk
+//! tree.save_snapshot("block_12345", "after block 12345")?;
+//! drop(tree); // Close the tree
 //!
-//! // Later, restore from disk
-//! tree.load_snapshot("block_12345")?;
+//! // Later, restore from the saved snapshot
+//! let tree = LsmTree::open_snapshot(db_path, "block_12345")?;
 //! # Ok(())
 //! # }
 //! ```
@@ -163,16 +161,19 @@
 //! # fn main() -> cardano_lsm::Result<()> {
 //! # let temp_dir = tempfile::tempdir()?;
 //! # let db_path = temp_dir.path();
-//! # let config = LsmConfig::default();
-//! let tree = Arc::new(LsmTree::open(db_path, config)?);
+//! # let mut tree = LsmTree::open(db_path, LsmConfig::default())?;
+//! # tree.insert(&Key::from(b"key"), &Value::from(b"value"))?;
+//! // Wrap in Arc to share across threads (reads are thread-safe)
+//! let tree = Arc::new(tree);
 //!
-//! let tree_clone = tree.clone();
-//! let handle = thread::spawn(move || {
-//!     tree_clone.get(&Key::from(b"key"))
-//! });
+//! let tree_a = tree.clone();
+//! let tree_b = tree.clone();
 //!
-//! tree.insert(Key::from(b"key"), Value::from(b"value"))?;
-//! handle.join().unwrap()?;
+//! let ha = thread::spawn(move || tree_a.get(&Key::from(b"key")));
+//! let hb = thread::spawn(move || tree_b.get(&Key::from(b"key")));
+//!
+//! ha.join().unwrap()?;
+//! hb.join().unwrap()?;
 //! # Ok(())
 //! # }
 //! ```
