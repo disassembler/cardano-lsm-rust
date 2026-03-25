@@ -594,19 +594,50 @@ impl LsmTree {
 
         // Fsync directories
         fsync_directory(&path)?;
-        fsync_directory(&active_dir)?;
         fsync_directory(&snapshots_dir)?;
 
         // Initialize memtable with snapshot's sequence number
         let memtable = MemTable::new(sequence_number);
 
-        // Open SSTables from snapshot directory
+        // Hard-link snapshot SSTable files into active/ before opening any SsTableHandles.
+        //
+        // CORRECTNESS: SsTableHandle::Drop calls delete_files() on its stored paths when
+        // the refcount reaches zero. If we opened handles pointing directly at
+        // snapshots/<name>/ (the old approach), dropping the tree (or compaction evicting
+        // runs) would delete the snapshot's SSTable files, permanently corrupting it.
+        //
+        // Fix: mirror Haskell lsm-tree's openTableFromSnapshot/hardLinkRunFiles —
+        // hard-link every SSTable file from snapshots/<name>/ → active/ first, then open
+        // SsTableHandle objects that point at active/.  When those handles are eventually
+        // dropped by compaction, only the active/ hard-links are removed; the snapshot
+        // directory retains its own inode and remains intact.
         let snapshot_dir = snapshots_dir.join(snapshot_name);
+
+        // Clear any stale files in active/ to avoid run-number conflicts.
+        for entry in std::fs::read_dir(&active_dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
+
+        const SSTABLE_EXTS: [&str; 5] = ["keyops", "blobs", "filter", "index", "checksums"];
+        for run in &snapshot.metadata.runs {
+            let prefix = format!("{:05}", run.run_number);
+            for ext in SSTABLE_EXTS {
+                let src = snapshot_dir.join(format!("{}.{}", prefix, ext));
+                let dst = active_dir.join(format!("{}.{}", prefix, ext));
+                std::fs::hard_link(&src, &dst).map_err(Error::Io)?;
+            }
+        }
+        fsync_directory(&active_dir)?;
+
+        // Open SSTables from active/ (never from the snapshot directory).
         let mut all_sstables = Vec::new();
         let mut max_run_number = 0u64;
 
         for run in &snapshot.metadata.runs {
-            match SsTableHandle::open(&snapshot_dir, run.run_number) {
+            match SsTableHandle::open(&active_dir, run.run_number) {
                 Ok(handle) => {
                     all_sstables.push(handle);
                     max_run_number = max_run_number.max(run.run_number);
@@ -618,7 +649,7 @@ impl LsmTree {
                              Consider deleting it and using a previous snapshot.",
                             run.run_number,
                             snapshot_name,
-                            snapshot_dir.display(),
+                            active_dir.display(),
                             e
                         )
                     ));
