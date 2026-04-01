@@ -477,6 +477,10 @@ pub struct LsmTree {
     compaction_thread: Mutex<Option<JoinHandle<()>>>,
     #[allow(dead_code)]  // stored for inspection/debugging; active value lives in background thread
     merge_batch_size: usize,
+
+    // Generation counter: incremented on every rollback so background compaction
+    // can detect that the tree state changed and discard a stale compaction result.
+    compaction_generation: Arc<AtomicU64>,
 }
 
 impl LsmTree {
@@ -571,6 +575,7 @@ impl LsmTree {
             Condvar::new(),
         ));
         let merge_batch_size = config.merge_batch_size;
+        let compaction_generation = Arc::new(AtomicU64::new(0));
 
         // Spawn background compaction thread
         let thread = {
@@ -581,8 +586,10 @@ impl LsmTree {
             let credits_t = merge_credits.clone();
             let trigger_t = compaction_trigger.clone();
             let batch = merge_batch_size as u64;
+            let l0_trig = config.level0_compaction_trigger;
+            let gen_t = compaction_generation.clone();
             std::thread::spawn(move || {
-                background_compact_loop(levels_t, run_num_t, compactor_t, active_dir_t, max_level, credits_t, trigger_t, batch);
+                background_compact_loop(levels_t, run_num_t, compactor_t, active_dir_t, max_level, credits_t, trigger_t, batch, l0_trig, gen_t);
             })
         };
 
@@ -603,6 +610,7 @@ impl LsmTree {
             compaction_trigger,
             compaction_thread: Mutex::new(Some(thread)),
             merge_batch_size,
+            compaction_generation,
         })
     }
 
@@ -740,6 +748,7 @@ impl LsmTree {
             Condvar::new(),
         ));
         let merge_batch_size = config.merge_batch_size;
+        let compaction_generation = Arc::new(AtomicU64::new(0));
 
         // Spawn background compaction thread
         let thread = {
@@ -750,8 +759,10 @@ impl LsmTree {
             let credits_t = merge_credits.clone();
             let trigger_t = compaction_trigger.clone();
             let batch = merge_batch_size as u64;
+            let l0_trig = config.level0_compaction_trigger;
+            let gen_t = compaction_generation.clone();
             std::thread::spawn(move || {
-                background_compact_loop(levels_t, run_num_t, compactor_t, active_dir_t, max_level, credits_t, trigger_t, batch);
+                background_compact_loop(levels_t, run_num_t, compactor_t, active_dir_t, max_level, credits_t, trigger_t, batch, l0_trig, gen_t);
             })
         };
 
@@ -772,6 +783,7 @@ impl LsmTree {
             compaction_trigger,
             compaction_thread: Mutex::new(Some(thread)),
             merge_batch_size,
+            compaction_generation,
         })
     }
 
@@ -1086,6 +1098,8 @@ impl LsmTree {
             &self.compactor,
             &self.active_dir,
             self.max_level,
+            self.config.level0_compaction_trigger,
+            &self.compaction_generation,
         )
     }
     
@@ -1172,10 +1186,16 @@ impl LsmTree {
             ));
         }
 
-        // Replace state
+        // Replace state. The levels write lock is held while bumping the generation
+        // counter so that any background compaction write-back that races with us
+        // will see the new generation and discard its (now-stale) result.
         *self.memtable.write().unwrap() = (*snapshot.memtable).clone();
         *self.immutable_memtables.write().unwrap() = snapshot.immutable_memtables;
-        *self.levels.write().unwrap() = snapshot.levels;
+        {
+            let mut levels = self.levels.write().unwrap();
+            *levels = snapshot.levels;
+            self.compaction_generation.fetch_add(1, Ordering::Release);
+        }
         *self.sequence_number.write().unwrap() = snapshot.sequence_number;
 
         Ok(())
@@ -1285,6 +1305,8 @@ fn background_compact_loop(
     merge_credits: Arc<AtomicU64>,
     trigger: Arc<(Mutex<CompactionSignal>, Condvar)>,
     merge_batch_size: u64,
+    level0_trigger: usize,
+    generation: Arc<AtomicU64>,
 ) {
     loop {
         // Wait for a signal or shutdown
@@ -1298,7 +1320,15 @@ fn background_compact_loop(
                 return;
             }
             signal.should_run = false;
-            merge_credits.load(Ordering::Relaxed) >= merge_batch_size
+            // Compact if credits have accumulated, OR if L0 is at/above the
+            // compaction trigger.  The second condition prevents the back-pressure
+            // deadlock where small flushes never accumulate enough credits but L0
+            // keeps growing until flush_memtable() spins waiting for it to drain.
+            let credits_ok = merge_credits.load(Ordering::Relaxed) >= merge_batch_size;
+            let l0_pressured = levels.read().unwrap()
+                .get(0)
+                .map_or(false, |l0| l0.len() >= level0_trigger);
+            credits_ok || l0_pressured
         };
 
         if should_compact {
@@ -1309,6 +1339,8 @@ fn background_compact_loop(
                 &compactor,
                 &active_dir,
                 max_level,
+                level0_trigger,
+                &generation,
             ) {
                 tracing::warn!(error = %e, "LSM background compaction error");
             } else {

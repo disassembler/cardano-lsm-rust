@@ -310,18 +310,47 @@ pub struct CompactionResult {
 ///
 /// This free function is called by both the synchronous `LsmTree::compact()` method
 /// and the background compaction thread, avoiding duplication of the compaction logic.
+///
+/// `level0_file_trigger`: if L0 has at least this many SSTable files, force a L0→L1
+/// compaction even when the entry-count threshold has not been reached.  This prevents
+/// the back-pressure deadlock that arises when many tiny SSTables accumulate in L0
+/// (e.g. small memtable configs in conformance tests).
 pub fn run_compaction(
     levels: &Arc<RwLock<Vec<Vec<SsTableHandle>>>>,
     next_run_number: &Arc<RwLock<RunNumber>>,
     compactor: &Arc<Compactor>,
     active_dir: &Path,
     max_level: u8,
+    level0_file_trigger: usize,
+    generation: &Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<()> {
+    // Read the generation before taking a levels snapshot.  If a rollback happens
+    // between here and the write-back, we discard the compaction result so we
+    // never overwrite the post-rollback state.
+    let gen_before = generation.load(std::sync::atomic::Ordering::Acquire);
+
     let levels_snapshot = levels.read().unwrap().clone();
 
     let job = match compactor.select_level_compaction(&levels_snapshot, max_level, 4) {
         Some(job) => job,
-        None => return Ok(()),
+        None => {
+            // Entry-count thresholds are not met, but check if L0 has accumulated
+            // enough *files* to warrant compaction.  This handles the case where
+            // each SSTable contains very few entries (e.g. 1-entry SSTables from a
+            // 4 KB memtable), so the entry count never reaches the normal threshold
+            // even though L0 has many files.
+            let l0_files = levels_snapshot.get(0).map_or(0, |l0| l0.len());
+            if l0_files < level0_file_trigger || l0_files == 0 {
+                return Ok(());
+            }
+            let source_runs = (0..l0_files).collect();
+            LevelCompactionJob {
+                source_level: 0,
+                target_level: 1,
+                source_runs,
+                target_level_runs: levels_snapshot.get(1).cloned().unwrap_or_default(),
+            }
+        }
     };
 
     let source_level = job.source_level as usize;
@@ -339,6 +368,15 @@ pub fn run_compaction(
 
     {
         let mut levels = levels.write().unwrap();
+
+        // Check if a rollback happened while we were compacting.  The generation
+        // counter is incremented (under the levels write lock) in rollback(), so
+        // this check is consistent: if the generation changed we must not modify
+        // the post-rollback levels with our stale compaction result.
+        let gen_after = generation.load(std::sync::atomic::Ordering::Acquire);
+        if gen_after != gen_before {
+            return Ok(());
+        }
 
         let mut to_remove = result.inputs_to_remove.clone();
         to_remove.sort_by(|a, b| b.cmp(a)); // descending so indices stay valid
