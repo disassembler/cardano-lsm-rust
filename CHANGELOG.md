@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.3] - 2026-04-01
+
+### Performance
+- O(1) SSTable point lookups via direct block-indexed reads
+
+### Fixed
+- Background compaction correctness under small entries and rollback
+
+## [1.0.2] - 2026-03-09
+
+### Fixed
+- Hard-link snapshot files into `active/` before opening in `open_snapshot`
+
+### Changed
+- Removed dead compaction selection methods and renamed `sstable_new` to `sstable`
+
+### Docs
+- Fix stale doctests to match current API
+- Update README to reflect `sstable.rs` filename
+
 ## [1.0.1] - 2026-03-09
 
 ### Fixed
