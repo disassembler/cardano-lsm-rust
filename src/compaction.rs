@@ -12,6 +12,7 @@ use crate::{Key, Value, Result};
 use crate::sstable::{SsTableHandle, SsTableWriter, RunNumber};
 use std::path::Path;
 use std::collections::BTreeMap;
+use std::sync::{Arc, RwLock};
 use serde::{Serialize, Deserialize};
 
 /// Compaction strategy for the LSM tree
@@ -303,6 +304,62 @@ pub struct CompactionResult {
     pub bytes_read: u64,
     /// Total bytes written to the output SSTable
     pub bytes_written: u64,
+}
+
+/// Execute one round of level-based compaction using shared Arc state.
+///
+/// This free function is called by both the synchronous `LsmTree::compact()` method
+/// and the background compaction thread, avoiding duplication of the compaction logic.
+pub fn run_compaction(
+    levels: &Arc<RwLock<Vec<Vec<SsTableHandle>>>>,
+    next_run_number: &Arc<RwLock<RunNumber>>,
+    compactor: &Arc<Compactor>,
+    active_dir: &Path,
+    max_level: u8,
+) -> Result<()> {
+    let levels_snapshot = levels.read().unwrap().clone();
+
+    let job = match compactor.select_level_compaction(&levels_snapshot, max_level, 4) {
+        Some(job) => job,
+        None => return Ok(()),
+    };
+
+    let source_level = job.source_level as usize;
+    let target_level = job.target_level as usize;
+
+    let run_number = {
+        let mut run_num = next_run_number.write().unwrap();
+        let current = *run_num;
+        *run_num += 1;
+        current
+    };
+
+    let source_runs = levels_snapshot[source_level].clone();
+    let result = compactor.compact_levels(job, &source_runs, active_dir, run_number, max_level)?;
+
+    {
+        let mut levels = levels.write().unwrap();
+
+        let mut to_remove = result.inputs_to_remove.clone();
+        to_remove.sort_by(|a, b| b.cmp(a)); // descending so indices stay valid
+
+        for idx in to_remove {
+            if idx < levels[source_level].len() {
+                let _removed = levels[source_level].remove(idx);
+            }
+        }
+
+        if let Some(output) = result.output {
+            if target_level == max_level as usize {
+                levels[target_level].clear();
+                levels[target_level].push(output);
+            } else {
+                levels[target_level].push(output);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

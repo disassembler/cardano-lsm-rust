@@ -40,6 +40,9 @@ byteorder = "1.5"
 thiserror = "1.0"
 anyhow = "1.0"
 
+# Tracing (zero-overhead no-op when no subscriber is installed)
+tracing = "0.1"
+
 # Concurrency
 parking_lot = "0.12"
 crossbeam = "0.8"

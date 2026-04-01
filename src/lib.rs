@@ -203,7 +203,9 @@ mod io_backend;  // I/O backend abstraction (sync vs io_uring)
 
 use std::path::{Path, PathBuf};
 use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Mutex, Condvar};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread::JoinHandle;
 use serde::{Serialize, Deserialize};
 use sstable::{SsTableWriter, SsTableHandle, RunNumber};
 use compaction::Compactor;
@@ -307,6 +309,9 @@ pub struct LsmConfig {
     // I/O backend (sync vs io_uring)
     #[serde(skip)]  // Don't serialize backend config
     pub io_backend: IoBackend,
+
+    // Background compaction: number of entries flushed before triggering one compaction cycle
+    pub merge_batch_size: usize,
 }
 
 impl Default for LsmConfig {
@@ -341,6 +346,8 @@ impl Default for LsmConfig {
             sstable_block_size: 4096,
 
             io_backend: IoBackend::default(),  // Default to sync I/O
+
+            merge_batch_size: 20_000,
         }
     }
 }
@@ -423,6 +430,13 @@ impl MemTable {
     }
 }
 
+// ===== Background Compaction Signal =====
+
+struct CompactionSignal {
+    should_run: bool,
+    shutdown: bool,
+}
+
 // ===== Main LSM Tree =====
 
 pub struct LsmTree {
@@ -456,6 +470,13 @@ pub struct LsmTree {
 
     // Compaction
     compactor: Arc<Compactor>,
+
+    // Background compaction
+    merge_credits: Arc<AtomicU64>,
+    compaction_trigger: Arc<(Mutex<CompactionSignal>, Condvar)>,
+    compaction_thread: Mutex<Option<JoinHandle<()>>>,
+    #[allow(dead_code)]  // stored for inspection/debugging; active value lives in background thread
+    merge_batch_size: usize,
 }
 
 impl LsmTree {
@@ -541,6 +562,30 @@ impl LsmTree {
         // Create compactor
         let compactor = Arc::new(Compactor::new());
 
+        // Shared state for background compaction
+        let levels_arc = Arc::new(RwLock::new(levels));
+        let next_run_number_arc = Arc::new(RwLock::new(next_run_number));
+        let merge_credits = Arc::new(AtomicU64::new(0));
+        let compaction_trigger = Arc::new((
+            Mutex::new(CompactionSignal { should_run: false, shutdown: false }),
+            Condvar::new(),
+        ));
+        let merge_batch_size = config.merge_batch_size;
+
+        // Spawn background compaction thread
+        let thread = {
+            let levels_t = levels_arc.clone();
+            let run_num_t = next_run_number_arc.clone();
+            let compactor_t = compactor.clone();
+            let active_dir_t = active_dir.clone();
+            let credits_t = merge_credits.clone();
+            let trigger_t = compaction_trigger.clone();
+            let batch = merge_batch_size as u64;
+            std::thread::spawn(move || {
+                background_compact_loop(levels_t, run_num_t, compactor_t, active_dir_t, max_level, credits_t, trigger_t, batch);
+            })
+        };
+
         Ok(Self {
             active_dir,
             snapshots_dir,
@@ -550,10 +595,14 @@ impl LsmTree {
             memtable: Arc::new(RwLock::new(memtable)),
             immutable_memtables: Arc::new(RwLock::new(Vec::new())),
             sequence_number: Arc::new(RwLock::new(sequence_number)),
-            next_run_number: Arc::new(RwLock::new(next_run_number)),
-            levels: Arc::new(RwLock::new(levels)),
+            next_run_number: next_run_number_arc,
+            levels: levels_arc,
             max_level,
             compactor,
+            merge_credits,
+            compaction_trigger,
+            compaction_thread: Mutex::new(Some(thread)),
+            merge_batch_size,
         })
     }
 
@@ -682,6 +731,30 @@ impl LsmTree {
         // Create compactor
         let compactor = Arc::new(Compactor::new());
 
+        // Shared state for background compaction
+        let levels_arc = Arc::new(RwLock::new(levels));
+        let next_run_number_arc = Arc::new(RwLock::new(next_run_number));
+        let merge_credits = Arc::new(AtomicU64::new(0));
+        let compaction_trigger = Arc::new((
+            Mutex::new(CompactionSignal { should_run: false, shutdown: false }),
+            Condvar::new(),
+        ));
+        let merge_batch_size = config.merge_batch_size;
+
+        // Spawn background compaction thread
+        let thread = {
+            let levels_t = levels_arc.clone();
+            let run_num_t = next_run_number_arc.clone();
+            let compactor_t = compactor.clone();
+            let active_dir_t = active_dir.clone();
+            let credits_t = merge_credits.clone();
+            let trigger_t = compaction_trigger.clone();
+            let batch = merge_batch_size as u64;
+            std::thread::spawn(move || {
+                background_compact_loop(levels_t, run_num_t, compactor_t, active_dir_t, max_level, credits_t, trigger_t, batch);
+            })
+        };
+
         Ok(Self {
             active_dir,
             snapshots_dir,
@@ -691,10 +764,14 @@ impl LsmTree {
             memtable: Arc::new(RwLock::new(memtable)),
             immutable_memtables: Arc::new(RwLock::new(Vec::new())),
             sequence_number: Arc::new(RwLock::new(sequence_number)),
-            next_run_number: Arc::new(RwLock::new(next_run_number)),
-            levels: Arc::new(RwLock::new(levels)),
+            next_run_number: next_run_number_arc,
+            levels: levels_arc,
             max_level,
             compactor,
+            merge_credits,
+            compaction_trigger,
+            compaction_thread: Mutex::new(Some(thread)),
+            merge_batch_size,
         })
     }
 
@@ -740,12 +817,9 @@ impl LsmTree {
         {
             let levels = self.levels.read().unwrap();
             for level in levels.iter() {
-                // Sort SSTables by run_number in DESCENDING order (newest first)
-                let mut sorted_sstables: Vec<&crate::sstable::SsTableHandle> = level.iter().collect();
-                sorted_sstables.sort_by_key(|b| std::cmp::Reverse(b.run_number()));
-
-                for sstable in sorted_sstables {
-                    // Check if key could be in this SSTable
+                // Iterate in reverse: SSTables are appended in ascending run_number order,
+                // so iterating backwards gives newest-first without Vec allocation
+                for sstable in level.iter().rev() {
                     if key >= &sstable.min_key && key <= &sstable.max_key {
                         if let Some(value) = sstable.get(key)? {
                             return Ok(Some(value));
@@ -949,6 +1023,8 @@ impl LsmTree {
             return Ok(());
         }
 
+        let entries_flushed = old_memtable.data.len() as u64;
+
         // Get next run number and increment
         let run_number = {
             let mut run_num = self.next_run_number.write().unwrap();
@@ -966,16 +1042,31 @@ impl LsmTree {
 
         let handle = writer.finish(0)?;  // Flushes always go to L0
 
-        // Add to L0
-        {
+        // Add to L0 and record current L0 depth for back-pressure check
+        let l0_len = {
             let mut levels = self.levels.write().unwrap();
             levels[0].push(handle);
+            levels[0].len()
+        };
 
-            // Check if we should trigger compaction (L0 size trigger)
-            if levels[0].len() >= self.config.level0_compaction_trigger {
-                drop(levels); // Release lock before compaction
-                // Trigger compaction
-                self.compact()?;
+        // Accumulate credits and wake background compaction thread
+        self.merge_credits.fetch_add(entries_flushed, Ordering::Relaxed);
+        {
+            let (lock, cvar) = &*self.compaction_trigger;
+            let mut signal = lock.lock().unwrap();
+            signal.should_run = true;
+            cvar.notify_one();
+        }
+
+        // Emergency back-pressure: if L0 grows critically large, wait for the
+        // background thread to drain it. Under normal conditions this never fires.
+        if l0_len > self.config.level0_compaction_trigger * 4 {
+            loop {
+                let current_l0 = self.levels.read().unwrap()[0].len();
+                if current_l0 <= self.config.level0_compaction_trigger * 2 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
 
@@ -989,72 +1080,13 @@ impl LsmTree {
     /// - L(max): Leveling (single merged run, tombstone removal)
     /// - Compact level i to level i+1 when level i exceeds size threshold
     pub fn compact(&mut self) -> Result<()> {
-        let levels_snapshot = self.levels.read().unwrap().clone();
-
-        // Select level for compaction using LazyLevelling policy
-        // Size ratio of 4 is standard for LSM trees
-        let job = match self.compactor.select_level_compaction(&levels_snapshot, self.max_level, 4) {
-            Some(job) => job,
-            None => {
-                // Nothing to compact
-                return Ok(());
-            }
-        };
-
-        let source_level = job.source_level as usize;
-        let target_level = job.target_level as usize;
-
-        // Get next run number for compacted SSTable
-        let run_number = {
-            let mut run_num = self.next_run_number.write().unwrap();
-            let current = *run_num;
-            *run_num += 1;
-            current
-        };
-
-        // Execute compaction
-        let source_runs = levels_snapshot[source_level].clone();
-        let result = self.compactor.compact_levels(
-            job,
-            &source_runs,
+        compaction::run_compaction(
+            &self.levels,
+            &self.next_run_number,
+            &self.compactor,
             &self.active_dir,
-            run_number,
             self.max_level,
-        )?;
-
-        // Update levels atomically
-        {
-            let mut levels = self.levels.write().unwrap();
-
-            // Remove source runs (in reverse order to maintain indices)
-            let mut to_remove = result.inputs_to_remove.clone();
-            to_remove.sort_by(|a, b| b.cmp(a)); // Sort descending
-
-            for idx in to_remove {
-                if idx < levels[source_level].len() {
-                    let _removed = levels[source_level].remove(idx);
-                    // The SsTableHandle will be dropped here, but files are only deleted
-                    // when the last reference is dropped (refcount reaches 0). This allows
-                    // ongoing range queries to safely access the files.
-                }
-            }
-
-            // Add output SSTable to target level
-            if let Some(output) = result.output {
-                // For bottom level (leveling): replace all runs with merged run
-                if target_level == self.max_level as usize {
-                    // Clear target level and add single merged run
-                    // Old handles will be dropped but files are protected by refcounting
-                    levels[target_level].clear();
-                    levels[target_level].push(output);
-                } else {
-                    // For other levels (tiering): just add the new run
-                    levels[target_level].push(output);
-                }
-            }
-        }
-
-        Ok(())
+        )
     }
     
     /// Compact ALL SSTables into one (removes all tombstones)
@@ -1220,6 +1252,73 @@ impl LsmTree {
         let snapshot = PersistentSnapshot::load(&self.path, name)?;
         snapshot.delete()
             .map_err(Error::Io)
+    }
+}
+
+impl Drop for LsmTree {
+    fn drop(&mut self) {
+        // Signal background thread to shut down
+        {
+            let (lock, cvar) = &*self.compaction_trigger;
+            let mut signal = lock.lock().unwrap();
+            signal.shutdown = true;
+            cvar.notify_one();
+        }
+        // Join the thread (we have &mut self so no other &self exists)
+        if let Some(thread) = self.compaction_thread.get_mut().unwrap().take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Background compaction loop run in a dedicated thread.
+///
+/// Waits for flush credits to accumulate to `merge_batch_size`, then runs one
+/// full compaction cycle.  Never blocks the write path except via the emergency
+/// back-pressure check in `flush_memtable`.
+fn background_compact_loop(
+    levels: Arc<RwLock<Vec<Vec<SsTableHandle>>>>,
+    next_run_number: Arc<RwLock<RunNumber>>,
+    compactor: Arc<Compactor>,
+    active_dir: PathBuf,
+    max_level: u8,
+    merge_credits: Arc<AtomicU64>,
+    trigger: Arc<(Mutex<CompactionSignal>, Condvar)>,
+    merge_batch_size: u64,
+) {
+    loop {
+        // Wait for a signal or shutdown
+        let should_compact = {
+            let (lock, cvar) = &*trigger;
+            let mut signal = lock.lock().unwrap();
+            while !signal.should_run && !signal.shutdown {
+                signal = cvar.wait(signal).unwrap();
+            }
+            if signal.shutdown {
+                return;
+            }
+            signal.should_run = false;
+            merge_credits.load(Ordering::Relaxed) >= merge_batch_size
+        };
+
+        if should_compact {
+            let t_compact = std::time::Instant::now();
+            if let Err(e) = compaction::run_compaction(
+                &levels,
+                &next_run_number,
+                &compactor,
+                &active_dir,
+                max_level,
+            ) {
+                tracing::warn!(error = %e, "LSM background compaction error");
+            } else {
+                tracing::info!(elapsed_ms = t_compact.elapsed().as_millis() as u64, "LSM compaction");
+            }
+            // Subtract one batch of credits (saturating to avoid any edge-case underflow)
+            let _ = merge_credits.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                Some(c.saturating_sub(merge_batch_size))
+            });
+        }
     }
 }
 

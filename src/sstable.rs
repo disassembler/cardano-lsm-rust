@@ -144,8 +144,13 @@ impl SsTableWriter {
         let max_key = self.entries.last().unwrap().0.clone();
         let num_entries = self.entries.len() as u64;
 
-        // Write keyops and blobs
+        // Write keyops and blobs, tracking byte offsets for index
+        let mut current_keyops_offset: u64 = 0;
+        let mut keyops_offsets = Vec::with_capacity(self.entries.len());
+
         for (key, value_opt) in &self.entries {
+            keyops_offsets.push(current_keyops_offset);
+
             // Write key
             let key_bytes = key.as_ref();
             self.keyops_writer.write_all(&(key_bytes.len() as u32).to_le_bytes())?;
@@ -166,9 +171,15 @@ impl SsTableWriter {
                     // Write value to blobs
                     self.blobs_writer.write_all(value_bytes)?;
                     self.blob_offset += value_len;
+
+                    // 4 (key_len field) + key_len + 1 (op) + 8 (blob_offset) + 8 (value_len)
+                    current_keyops_offset += 4 + key_bytes.len() as u64 + 17;
                 }
                 None => {
                     self.keyops_writer.write_all(&[0u8])?; // Delete operation
+
+                    // 4 (key_len field) + key_len + 1 (op)
+                    current_keyops_offset += 4 + key_bytes.len() as u64 + 1;
                 }
             }
         }
@@ -189,9 +200,10 @@ impl SsTableWriter {
             .map_err(|e| Error::Serialization(e.to_string()))?;
         let filter_crc = crate::checksum_handle::write_file_with_checksum(&self.paths.filter, &filter_bytes)?;
 
-        // Build index (simple: just store all keys for now)
+        // Build index with keys and their keyops file offsets for direct seek
         let index = Index {
             keys: self.entries.iter().map(|(k, _)| k.as_ref().to_vec()).collect(),
+            keyops_offsets,
         };
 
         // Write index file
@@ -355,22 +367,53 @@ impl SsTableHandle {
 
     /// Get a value by key using specific I/O backend
     pub fn get_backend(&self, key: &Key, backend: &IoBackend) -> Result<Option<Value>> {
-        // Check bloom filter first (fast negative lookup)
+        // Bloom filter: fast in-memory negative check
         if !self.bloom_filter.might_contain(key.as_ref()) {
             return Ok(None);
         }
 
-        // Binary search in index
+        // Binary search in index for exact key position
         let key_bytes = key.as_ref();
-        let _pos = match self.index.keys.binary_search_by(|k| k.as_slice().cmp(key_bytes)) {
+        let pos = match self.index.keys.binary_search_by(|k| k.as_slice().cmp(key_bytes)) {
             Ok(pos) => pos,
-            Err(_) => return Ok(None), // Not found
+            Err(_) => return Ok(None),
         };
 
-        // For now, do a full scan - in a real implementation we'd use the index
-        // to jump to the right offset in the keyops file
-        let range_results = self.range_with_tombstones_backend(key, key, backend)?;
+        // Use stored keyops offset for direct positioned read (O(1) syscalls)
+        if let Some(&keyops_offset) = self.index.keyops_offsets.get(pos) {
+            // Read: 4 (key_len field) + key_len + 1 (op byte) bytes
+            let prefix_len = 4 + key_bytes.len() + 1;
+            let prefix = io_backend::read_range(
+                &self.paths.keyops,
+                keyops_offset,
+                prefix_len,
+                backend,
+            )
+            .map_err(Error::Io)?;
+            let op = prefix[prefix_len - 1];
 
+            if op == 0 {
+                return Ok(None); // Tombstone
+            }
+
+            // Insert: read blob_offset (8 bytes) + value_len (8 bytes)
+            let meta = io_backend::read_range(
+                &self.paths.keyops,
+                keyops_offset + prefix_len as u64,
+                16,
+                backend,
+            )
+            .map_err(Error::Io)?;
+            let blob_offset = u64::from_le_bytes(meta[..8].try_into().unwrap());
+            let value_len = u64::from_le_bytes(meta[8..16].try_into().unwrap()) as usize;
+
+            let blob = io_backend::read_range(&self.paths.blobs, blob_offset, value_len, backend)
+                .map_err(Error::Io)?;
+            return Ok(Some(Value::from(&blob)));
+        }
+
+        // Fallback: full scan for SSTables without offset index (should not occur for new tables)
+        let range_results = self.range_with_tombstones_backend(key, key, backend)?;
         if let Some((_, value_opt)) = range_results.first() {
             Ok(value_opt.clone())
         } else {
@@ -658,6 +701,8 @@ impl BloomFilter {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Index {
     keys: Vec<Vec<u8>>,
+    #[serde(default)]
+    keyops_offsets: Vec<u64>,  // byte offset of each key's entry in the keyops file
 }
 
 #[cfg(test)]
