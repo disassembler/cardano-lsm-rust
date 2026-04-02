@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.4] - 2026-04-02
+
+### Fixed
+- Preserve original SSTable run_numbers and level assignments across snapshot
+  save/restore; sequential renumbering caused soft-tombstoned keys to
+  resurface after restoring from a snapshot when a value had been compacted
+  to L1 and a tombstone subsequently written to L0
+
+### Changed
+- `SnapshotRun` gains a `level` field (`#[serde(default)]` for backward compat)
+- Nix build now reads version from `Cargo.toml` via `lib.importTOML` instead
+  of a hardcoded string
+
+### Tests
+- `test_soft_tombstone_survives_snapshot_roundtrip`: tombstone in L0 roundtrips correctly
+- `test_soft_tombstone_wins_over_compacted_value`: tombstone beats a value
+  compacted to L1 after snapshot restore (regression test for the above bug)
+
 ## [1.0.3] - 2026-04-01
 
 ### Performance
