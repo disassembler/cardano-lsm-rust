@@ -8,12 +8,11 @@
 // - Linux: blockio-uring (asynchronous batched I/O)
 // - Other platforms: sequential I/O
 
-use std::path::Path;
 use std::io;
+use std::path::Path;
 
 /// I/O backend configuration
-#[derive(Clone, Debug)]
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub enum IoBackend {
     /// Synchronous I/O (default, all platforms)
     #[default]
@@ -23,7 +22,6 @@ pub enum IoBackend {
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
     IoUring,
 }
-
 
 /// Read a file completely using the specified backend
 pub fn read_file(path: &Path, backend: &IoBackend) -> io::Result<Vec<u8>> {
@@ -178,13 +176,7 @@ mod tests {
         fs::write(&path2, b"File Two")?;
 
         let backend = IoBackend::Sync;
-        let results = read_batch(
-            vec![
-                (&path1, 0, 8),
-                (&path2, 0, 8),
-            ],
-            &backend,
-        )?;
+        let results = read_batch(vec![(&path1, 0, 8), (&path2, 0, 8)], &backend)?;
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0], b"File One");

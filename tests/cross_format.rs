@@ -54,8 +54,22 @@ fn test_haskell_format_structure() -> Result<()> {
     let snapshots_dir = db_path.join("snapshots");
 
     println!("\nDirectory structure:");
-    println!("  ✓ active/: {}", if active_dir.exists() { "exists" } else { "missing" });
-    println!("  ✓ snapshots/: {}", if snapshots_dir.exists() { "exists" } else { "missing" });
+    println!(
+        "  ✓ active/: {}",
+        if active_dir.exists() {
+            "exists"
+        } else {
+            "missing"
+        }
+    );
+    println!(
+        "  ✓ snapshots/: {}",
+        if snapshots_dir.exists() {
+            "exists"
+        } else {
+            "missing"
+        }
+    );
 
     // Check active directory contents
     if active_dir.exists() {
@@ -128,10 +142,7 @@ fn test_rust_format_structure() -> Result<()> {
     tree.delete(&Key::from(b"key4"))?;
 
     // Update
-    tree.insert(
-        &Key::from(b"key1"),
-        &Value::from(b"updated_value1"),
-    )?;
+    tree.insert(&Key::from(b"key1"), &Value::from(b"updated_value1"))?;
 
     // Prefix keys
     for i in 1..=5 {
@@ -172,8 +183,22 @@ fn test_rust_format_structure() -> Result<()> {
     let snapshots_dir = db_path.join("snapshots");
 
     println!("\nDirectory structure:");
-    println!("  ✓ active/: {}", if active_dir.exists() { "exists" } else { "missing" });
-    println!("  ✓ snapshots/: {}", if snapshots_dir.exists() { "exists" } else { "missing" });
+    println!(
+        "  ✓ active/: {}",
+        if active_dir.exists() {
+            "exists"
+        } else {
+            "missing"
+        }
+    );
+    println!(
+        "  ✓ snapshots/: {}",
+        if snapshots_dir.exists() {
+            "exists"
+        } else {
+            "missing"
+        }
+    );
 
     // Check snapshot directories for SSTable files
     println!("\nSnapshot structure:");
@@ -184,11 +209,7 @@ fn test_rust_format_structure() -> Result<()> {
 
             let sstable_files: Vec<_> = std::fs::read_dir(&snap_dir)?
                 .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.file_name()
-                        .to_string_lossy()
-                        .ends_with(".keyops")
-                })
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".keyops"))
                 .collect();
 
             println!("    Found {} SSTable(s)", sstable_files.len());
@@ -197,7 +218,10 @@ fn test_rust_format_structure() -> Result<()> {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
                 let run_num = name_str.strip_suffix(".keyops").unwrap();
-                println!("      Run {}: 5 files (.keyops, .blobs, .filter, .index, .checksums)", run_num);
+                println!(
+                    "      Run {}: 5 files (.keyops, .blobs, .filter, .index, .checksums)",
+                    run_num
+                );
             }
         }
     }

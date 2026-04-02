@@ -65,10 +65,7 @@ impl ChecksumHandle {
 /// 3. Close and get checksum
 ///
 /// Returns the checksum of the written data.
-pub fn write_file_with_checksum<P: AsRef<Path>>(
-    path: P,
-    data: &[u8],
-) -> io::Result<CRC32C> {
+pub fn write_file_with_checksum<P: AsRef<Path>>(path: P, data: &[u8]) -> io::Result<CRC32C> {
     let mut handle = ChecksumHandle::create(path)?;
     handle.write_all(data)?;
     handle.close()
@@ -130,5 +127,4 @@ mod tests {
 
         Ok(())
     }
-
 }

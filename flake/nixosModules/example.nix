@@ -18,11 +18,11 @@
         options.services.${name} = {
           enable = lib.mkEnableOption "description";
           package = lib.mkPackageOption pkgs name {};
-
         };
 
-        config = lib.mkIf cfg.enable {
-        };
+        config =
+          lib.mkIf cfg.enable {
+          };
       };
     };
   };

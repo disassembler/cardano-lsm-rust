@@ -193,28 +193,31 @@
 mod atomic_file;
 mod checksum;
 mod checksum_handle;
-mod session_lock;
-mod snapshot;
-mod sstable;
 mod compaction;
+mod io_backend;
 mod merkle;
 mod monoidal;
-mod io_backend;  // I/O backend abstraction (sync vs io_uring)
+mod session_lock;
+mod snapshot;
+mod sstable; // I/O backend abstraction (sync vs io_uring)
 
-use std::path::{Path, PathBuf};
-use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock, Mutex, Condvar};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread::JoinHandle;
-use serde::{Serialize, Deserialize};
-use sstable::{SsTableWriter, SsTableHandle, RunNumber};
-use compaction::Compactor;
 use atomic_file::fsync_directory;
-use session_lock::SessionLock;
+use compaction::Compactor;
 use io_backend::IoBackend;
+use serde::{Deserialize, Serialize};
+use session_lock::SessionLock;
+use sstable::{RunNumber, SsTableHandle, SsTableWriter};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::thread::JoinHandle;
 
 // Re-export public types
-pub use merkle::{IncrementalMerkleTree, MerkleProof, MerkleRoot, MerkleLeaf, Direction, Hash, MerkleDiff, MerkleSnapshot};
+pub use merkle::{
+    Direction, Hash, IncrementalMerkleTree, MerkleDiff, MerkleLeaf, MerkleProof, MerkleRoot,
+    MerkleSnapshot,
+};
 pub use monoidal::{Monoidal, MonoidalLsmTree, MonoidalSnapshot};
 pub use snapshot::{PersistentSnapshot, SnapshotMetadata, SnapshotRun};
 
@@ -250,7 +253,7 @@ impl Key {
     pub fn from(bytes: impl AsRef<[u8]>) -> Self {
         Key(bytes.as_ref().to_vec())
     }
-    
+
     #[allow(clippy::should_implement_trait)]
     pub fn as_ref(&self) -> &[u8] {
         &self.0
@@ -286,12 +289,12 @@ pub struct LsmConfig {
     pub memtable_size: usize,
     pub max_immutable_memtables: usize,
     pub block_cache_size: usize,
-    
+
     // Compaction
     pub compaction_strategy: CompactionStrategy,
     pub compaction_threads: usize,
     pub level0_compaction_trigger: usize,
-    
+
     // Bloom filters
     pub bloom_filter_bits_per_key: usize,
     pub bloom_filter_fp_rate: f64,
@@ -299,7 +302,7 @@ pub struct LsmConfig {
     // Snapshots
     pub max_snapshots_per_wallet: usize,
     pub snapshot_interval: std::time::Duration,
-    
+
     // SSTables
     pub sstable_size: usize,
     pub sstable_block_size: usize,
@@ -307,7 +310,7 @@ pub struct LsmConfig {
     // Future enhancement: Add compression support for SSTables
 
     // I/O backend (sync vs io_uring)
-    #[serde(skip)]  // Don't serialize backend config
+    #[serde(skip)] // Don't serialize backend config
     pub io_backend: IoBackend,
 
     // Background compaction: number of entries flushed before triggering one compaction cycle
@@ -320,7 +323,7 @@ impl Default for LsmConfig {
             memtable_size: 64 * 1024 * 1024,
             max_immutable_memtables: 2,
             block_cache_size: 256 * 1024 * 1024,
-            
+
             compaction_strategy: CompactionStrategy::Hybrid {
                 l0_strategy: Box::new(CompactionStrategy::Tiered {
                     size_ratio: 4.0,
@@ -335,17 +338,17 @@ impl Default for LsmConfig {
             },
             compaction_threads: 2,
             level0_compaction_trigger: 4,
-            
+
             bloom_filter_bits_per_key: 10,
             bloom_filter_fp_rate: 0.01,
 
             max_snapshots_per_wallet: 10,
             snapshot_interval: std::time::Duration::from_secs(600),
-            
+
             sstable_size: 64 * 1024 * 1024,
             sstable_block_size: 4096,
 
-            io_backend: IoBackend::default(),  // Default to sync I/O
+            io_backend: IoBackend::default(), // Default to sync I/O
 
             merge_batch_size: 20_000,
         }
@@ -359,7 +362,7 @@ pub use compaction::CompactionStrategy;
 
 /// In-memory sorted write buffer
 struct MemTable {
-    data: BTreeMap<Key, Option<Value>>,  // None = tombstone (deleted)
+    data: BTreeMap<Key, Option<Value>>, // None = tombstone (deleted)
     size_bytes: usize,
     sequence_number: u64,
 }
@@ -372,11 +375,11 @@ impl MemTable {
             sequence_number,
         }
     }
-    
+
     fn insert(&mut self, key: Key, value: Value) {
         let key_size = key.0.len();
         let value_size = value.0.len();
-        
+
         // Update size
         if let Some(old_value) = self.data.get(&key) {
             if let Some(v) = old_value {
@@ -385,14 +388,14 @@ impl MemTable {
         } else {
             self.size_bytes += key_size;
         }
-        
+
         self.size_bytes += value_size;
         self.data.insert(key, Some(value));
     }
-    
+
     fn delete(&mut self, key: Key) {
         let key_size = key.0.len();
-        
+
         if let Some(old_value) = self.data.get(&key) {
             if let Some(v) = old_value {
                 self.size_bytes -= v.0.len();
@@ -400,31 +403,36 @@ impl MemTable {
         } else {
             self.size_bytes += key_size;
         }
-        
+
         // Tombstone
         self.data.insert(key, None);
     }
-    
+
     fn get(&self, key: &Key) -> Option<&Option<Value>> {
         self.data.get(key)
     }
-    
+
     fn size_bytes(&self) -> usize {
         self.size_bytes
     }
-    
+
     fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
-    
+
     fn iter(&self) -> impl Iterator<Item = (&Key, &Option<Value>)> {
         self.data.iter()
     }
-    
-    fn range<'a>(&'a self, from: &Key, to: &Key) -> impl Iterator<Item = (&'a Key, &'a Option<Value>)> + 'a {
+
+    fn range<'a>(
+        &'a self,
+        from: &Key,
+        to: &Key,
+    ) -> impl Iterator<Item = (&'a Key, &'a Option<Value>)> + 'a {
         if from > to {
             // Return empty iterator for reversed bounds
-            return Box::new(std::iter::empty()) as Box<dyn Iterator<Item = (&'a Key, &'a Option<Value>)> + 'a>;
+            return Box::new(std::iter::empty())
+                as Box<dyn Iterator<Item = (&'a Key, &'a Option<Value>)> + 'a>;
         }
         Box::new(self.data.range(from..=to))
     }
@@ -441,9 +449,9 @@ struct CompactionSignal {
 
 pub struct LsmTree {
     path: PathBuf,
-    active_dir: PathBuf,     // active/ - mutable SSTables
+    active_dir: PathBuf, // active/ - mutable SSTables
     #[allow(dead_code)]
-    snapshots_dir: PathBuf,  // snapshots/ - persistent snapshots
+    snapshots_dir: PathBuf, // snapshots/ - persistent snapshots
     config: LsmConfig,
 
     // Session lock - prevents concurrent access
@@ -475,7 +483,7 @@ pub struct LsmTree {
     merge_credits: Arc<AtomicU64>,
     compaction_trigger: Arc<(Mutex<CompactionSignal>, Condvar)>,
     compaction_thread: Mutex<Option<JoinHandle<()>>>,
-    #[allow(dead_code)]  // stored for inspection/debugging; active value lives in background thread
+    #[allow(dead_code)] // stored for inspection/debugging; active value lives in background thread
     merge_batch_size: usize,
 
     // Generation counter: incremented on every rollback so background compaction
@@ -492,8 +500,8 @@ impl LsmTree {
 
         // Acquire session lock FIRST (before any other file operations)
         // This prevents concurrent access that could corrupt the database
-        let session_lock = SessionLock::acquire(&path)
-            .map_err(|e| Error::SessionLocked(e.to_string()))?;
+        let session_lock =
+            SessionLock::acquire(&path).map_err(|e| Error::SessionLocked(e.to_string()))?;
 
         // Create directory structure matching Haskell:
         // root/
@@ -534,7 +542,9 @@ impl LsmTree {
 
                             match SsTableHandle::open(&active_dir, run_num) {
                                 Ok(handle) => all_sstables.push(handle),
-                                Err(e) => eprintln!("Failed to load SSTable run {}: {}", run_num, e),
+                                Err(e) => {
+                                    eprintln!("Failed to load SSTable run {}: {}", run_num, e)
+                                }
                             }
                         }
                     }
@@ -554,7 +564,10 @@ impl LsmTree {
             if level <= max_level as usize {
                 levels[level].push(handle);
             } else {
-                eprintln!("Warning: SSTable with level {} exceeds max_level {}", level, max_level);
+                eprintln!(
+                    "Warning: SSTable with level {} exceeds max_level {}",
+                    level, max_level
+                );
             }
         }
 
@@ -562,7 +575,7 @@ impl LsmTree {
         for level in &mut levels {
             level.sort_by(|a, b| a.min_key.cmp(&b.min_key));
         }
-        
+
         // Create compactor
         let compactor = Arc::new(Compactor::new());
 
@@ -571,7 +584,10 @@ impl LsmTree {
         let next_run_number_arc = Arc::new(RwLock::new(next_run_number));
         let merge_credits = Arc::new(AtomicU64::new(0));
         let compaction_trigger = Arc::new((
-            Mutex::new(CompactionSignal { should_run: false, shutdown: false }),
+            Mutex::new(CompactionSignal {
+                should_run: false,
+                shutdown: false,
+            }),
             Condvar::new(),
         ));
         let merge_batch_size = config.merge_batch_size;
@@ -589,7 +605,18 @@ impl LsmTree {
             let l0_trig = config.level0_compaction_trigger;
             let gen_t = compaction_generation.clone();
             std::thread::spawn(move || {
-                background_compact_loop(levels_t, run_num_t, compactor_t, active_dir_t, max_level, credits_t, trigger_t, batch, l0_trig, gen_t);
+                background_compact_loop(
+                    levels_t,
+                    run_num_t,
+                    compactor_t,
+                    active_dir_t,
+                    max_level,
+                    credits_t,
+                    trigger_t,
+                    batch,
+                    l0_trig,
+                    gen_t,
+                );
             })
         };
 
@@ -640,8 +667,8 @@ impl LsmTree {
         let sequence_number = snapshot.metadata.sequence_number;
 
         // Acquire session lock
-        let session_lock = SessionLock::acquire(&path)
-            .map_err(|e| Error::SessionLocked(e.to_string()))?;
+        let session_lock =
+            SessionLock::acquire(&path).map_err(|e| Error::SessionLocked(e.to_string()))?;
 
         // Create directory structure
         let active_dir = path.join("active");
@@ -705,16 +732,14 @@ impl LsmTree {
                     max_run_number = max_run_number.max(run.run_number);
                 }
                 Err(e) => {
-                    return Err(Error::InvalidOperation(
-                        format!(
-                            "Failed to load SSTable run {} from snapshot '{}' at {}:\n  {}\n\nThis snapshot may be corrupted. \
+                    return Err(Error::InvalidOperation(format!(
+                        "Failed to load SSTable run {} from snapshot '{}' at {}:\n  {}\n\nThis snapshot may be corrupted. \
                              Consider deleting it and using a previous snapshot.",
-                            run.run_number,
-                            snapshot_name,
-                            active_dir.display(),
-                            e
-                        )
-                    ));
+                        run.run_number,
+                        snapshot_name,
+                        active_dir.display(),
+                        e
+                    )));
                 }
             }
         }
@@ -731,7 +756,10 @@ impl LsmTree {
             if level <= max_level as usize {
                 levels[level].push(handle);
             } else {
-                eprintln!("Warning: SSTable with level {} exceeds max_level {}", level, max_level);
+                eprintln!(
+                    "Warning: SSTable with level {} exceeds max_level {}",
+                    level, max_level
+                );
             }
         }
 
@@ -748,7 +776,10 @@ impl LsmTree {
         let next_run_number_arc = Arc::new(RwLock::new(next_run_number));
         let merge_credits = Arc::new(AtomicU64::new(0));
         let compaction_trigger = Arc::new((
-            Mutex::new(CompactionSignal { should_run: false, shutdown: false }),
+            Mutex::new(CompactionSignal {
+                should_run: false,
+                shutdown: false,
+            }),
             Condvar::new(),
         ));
         let merge_batch_size = config.merge_batch_size;
@@ -766,7 +797,18 @@ impl LsmTree {
             let l0_trig = config.level0_compaction_trigger;
             let gen_t = compaction_generation.clone();
             std::thread::spawn(move || {
-                background_compact_loop(levels_t, run_num_t, compactor_t, active_dir_t, max_level, credits_t, trigger_t, batch, l0_trig, gen_t);
+                background_compact_loop(
+                    levels_t,
+                    run_num_t,
+                    compactor_t,
+                    active_dir_t,
+                    max_level,
+                    credits_t,
+                    trigger_t,
+                    batch,
+                    l0_trig,
+                    gen_t,
+                );
             })
         };
 
@@ -809,7 +851,7 @@ impl LsmTree {
 
         Ok(())
     }
-    
+
     pub fn get(&self, key: &Key) -> Result<Option<Value>> {
         // Check memtable first
         {
@@ -818,7 +860,7 @@ impl LsmTree {
                 return Ok(value_opt.clone());
             }
         }
-        
+
         // Check immutable memtables
         {
             let immutables = self.immutable_memtables.read().unwrap();
@@ -828,7 +870,7 @@ impl LsmTree {
                 }
             }
         }
-        
+
         // Check SSTables (newest to oldest, L0 to Lmax)
         {
             let levels = self.levels.read().unwrap();
@@ -847,7 +889,7 @@ impl LsmTree {
 
         Ok(None)
     }
-    
+
     pub fn delete(&mut self, key: &Key) -> Result<()> {
         // Ephemeral write - only persisted via save_snapshot()
         // No WAL, writes lost on crash until snapshot is saved
@@ -949,7 +991,8 @@ impl LsmTree {
             for level in levels.iter().rev() {
                 // Sort SSTables by run_number in ASCENDING order (oldest first)
                 // so newer values can overwrite older ones with .insert()
-                let mut sorted_sstables: Vec<&crate::sstable::SsTableHandle> = level.iter().collect();
+                let mut sorted_sstables: Vec<&crate::sstable::SsTableHandle> =
+                    level.iter().collect();
                 sorted_sstables.sort_by_key(|a| a.run_number());
 
                 for sstable in sorted_sstables {
@@ -968,7 +1011,7 @@ impl LsmTree {
                 }
             }
         }
-        
+
         // From immutable memtables
         {
             let immutables = self.immutable_memtables.read().unwrap();
@@ -978,7 +1021,7 @@ impl LsmTree {
                 }
             }
         }
-        
+
         // From current memtable (newest, highest priority)
         {
             let memtable = self.memtable.read().unwrap();
@@ -986,19 +1029,19 @@ impl LsmTree {
                 entries.insert(k.clone(), v.clone());
             }
         }
-        
+
         // Filter out tombstones and convert to Vec
         let results: Vec<_> = entries
             .into_iter()
             .filter_map(|(k, v)| v.map(|val| (k, val)))
             .collect();
-        
+
         RangeIter {
             entries: results,
             index: 0,
         }
     }
-    
+
     pub fn scan_prefix(&self, prefix: &[u8]) -> RangeIter {
         // Create an end key by incrementing the last byte
         let mut end_bytes = prefix.to_vec();
@@ -1012,19 +1055,19 @@ impl LsmTree {
             // Empty prefix matches everything
             end_bytes = vec![0xFF; 20];
         }
-        
+
         self.range(&Key::from(prefix), &Key::from(&end_bytes))
     }
-    
+
     pub fn iter(&self) -> RangeIter {
         self.range(&Key::from(b""), &Key::from([0xFF; 256]))
     }
-    
+
     pub fn flush(&self) -> Result<()> {
         // No-op: With ephemeral writes, flush only happens via save_snapshot()
         Ok(())
     }
-    
+
     fn flush_memtable(&mut self) -> Result<()> {
         // Move current memtable to immutable list
         let old_memtable = {
@@ -1056,7 +1099,7 @@ impl LsmTree {
             writer.add(key.clone(), value_opt.clone())?;
         }
 
-        let handle = writer.finish(0)?;  // Flushes always go to L0
+        let handle = writer.finish(0)?; // Flushes always go to L0
 
         // Add to L0 and record current L0 depth for back-pressure check
         let l0_len = {
@@ -1066,7 +1109,8 @@ impl LsmTree {
         };
 
         // Accumulate credits and wake background compaction thread
-        self.merge_credits.fetch_add(entries_flushed, Ordering::Relaxed);
+        self.merge_credits
+            .fetch_add(entries_flushed, Ordering::Relaxed);
         {
             let (lock, cvar) = &*self.compaction_trigger;
             let mut signal = lock.lock().unwrap();
@@ -1088,7 +1132,7 @@ impl LsmTree {
 
         Ok(())
     }
-    
+
     /// Trigger compaction using LazyLevelling policy
     ///
     /// LazyLevelling:
@@ -1106,7 +1150,7 @@ impl LsmTree {
             &self.compaction_generation,
         )
     }
-    
+
     /// Compact ALL SSTables into one (removes all tombstones)
     pub fn compact_all(&mut self) -> Result<()> {
         // Collect all SSTables from all levels
@@ -1134,7 +1178,9 @@ impl LsmTree {
             current
         };
 
-        let result = self.compactor.compact(job, &all_sstables, &self.active_dir, run_number)?;
+        let result = self
+            .compactor
+            .compact(job, &all_sstables, &self.active_dir, run_number)?;
 
         // Clear all levels and add the single compacted SSTable
         {
@@ -1154,19 +1200,19 @@ impl LsmTree {
 
         Ok(())
     }
-    
+
     pub fn trigger_background_compaction(&self) {
         // For now, this is a no-op
         // In a real implementation, this would signal a background thread
         // to run compaction asynchronously
     }
-    
+
     pub fn wait_for_compaction(&self) {
         // For now, this is a no-op
         // In a real implementation, this would wait for background
         // compaction to complete
     }
-    
+
     pub fn snapshot(&self) -> LsmSnapshot {
         let memtable = self.memtable.read().unwrap();
         let immutables = self.immutable_memtables.read().unwrap();
@@ -1180,13 +1226,13 @@ impl LsmTree {
             sequence_number: seq,
         }
     }
-    
+
     pub fn rollback(&mut self, snapshot: LsmSnapshot) -> Result<()> {
         // Verify we're not rolling back to the future
         let current_seq = *self.sequence_number.read().unwrap();
         if snapshot.sequence_number > current_seq {
             return Err(Error::InvalidOperation(
-                "Cannot rollback to future snapshot".to_string()
+                "Cannot rollback to future snapshot".to_string(),
             ));
         }
 
@@ -1204,7 +1250,7 @@ impl LsmTree {
 
         Ok(())
     }
-    
+
     pub fn disk_usage(&self) -> Result<u64> {
         let mut total = 0u64;
 
@@ -1220,7 +1266,7 @@ impl LsmTree {
 
         Ok(total)
     }
-    
+
     pub fn get_stats(&self) -> Result<LsmStats> {
         let memtable = self.memtable.read().unwrap();
         let immutables = self.immutable_memtables.read().unwrap();
@@ -1274,8 +1320,7 @@ impl LsmTree {
     /// Delete a snapshot by name
     pub fn delete_snapshot(&self, name: &str) -> Result<()> {
         let snapshot = PersistentSnapshot::load(&self.path, name)?;
-        snapshot.delete()
-            .map_err(Error::Io)
+        snapshot.delete().map_err(Error::Io)
     }
 }
 
@@ -1329,7 +1374,9 @@ fn background_compact_loop(
             // deadlock where small flushes never accumulate enough credits but L0
             // keeps growing until flush_memtable() spins waiting for it to drain.
             let credits_ok = merge_credits.load(Ordering::Relaxed) >= merge_batch_size;
-            let l0_pressured = levels.read().unwrap()
+            let l0_pressured = levels
+                .read()
+                .unwrap()
                 .get(0)
                 .map_or(false, |l0| l0.len() >= level0_trigger);
             credits_ok || l0_pressured
@@ -1348,7 +1395,10 @@ fn background_compact_loop(
             ) {
                 tracing::warn!(error = %e, "LSM background compaction error");
             } else {
-                tracing::info!(elapsed_ms = t_compact.elapsed().as_millis() as u64, "LSM compaction");
+                tracing::info!(
+                    elapsed_ms = t_compact.elapsed().as_millis() as u64,
+                    "LSM compaction"
+                );
             }
             // Subtract one batch of credits (saturating to avoid any edge-case underflow)
             let _ = merge_credits.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
@@ -1378,7 +1428,7 @@ pub struct RangeIter {
 
 impl Iterator for RangeIter {
     type Item = (Key, Value);
-    
+
     fn next(&mut self) -> Option<Self::Item> {
         if self.index < self.entries.len() {
             let item = self.entries[self.index].clone();
@@ -1413,7 +1463,7 @@ impl LsmSnapshot {
     pub fn sequence_number(&self) -> u64 {
         self.sequence_number
     }
-    
+
     pub fn get(&self, key: &Key) -> Result<Option<Value>> {
         // Check memtable
         if let Some(value_opt) = self.memtable.get(key) {
@@ -1440,14 +1490,15 @@ impl LsmSnapshot {
 
         Ok(None)
     }
-    
+
     pub fn iter(&self) -> RangeIter {
         let mut entries: BTreeMap<Key, Option<Value>> = BTreeMap::new();
 
         // Collect from SSTables (all levels, lowest priority)
         for level in self.levels.iter().rev() {
             for sstable in level {
-                if let Ok(sstable_entries) = sstable.range(&Key::from(b""), &Key::from([0xFF; 256])) {
+                if let Ok(sstable_entries) = sstable.range(&Key::from(b""), &Key::from([0xFF; 256]))
+                {
                     for (k, v) in sstable_entries {
                         entries.entry(k).or_insert(v);
                     }
@@ -1532,7 +1583,10 @@ mod tests {
         let tree = LsmTree::open_snapshot(&path, "snap1").unwrap();
         let result = tree.get(&key).unwrap();
         assert!(
-            result.as_ref().map(|v| v.as_ref().is_empty()).unwrap_or(false),
+            result
+                .as_ref()
+                .map(|v| v.as_ref().is_empty())
+                .unwrap_or(false),
             "Expected empty (tombstone) bytes after restore, got {:?}",
             result.map(|v| v.as_ref().to_vec())
         );
@@ -1576,14 +1630,18 @@ mod tests {
 
             // Verify value is now in L1
             let stats = tree.get_stats().unwrap();
-            assert_eq!(stats.l0_sstables_count, 0, "expected L0 empty after compact");
+            assert_eq!(
+                stats.l0_sstables_count, 0,
+                "expected L0 empty after compact"
+            );
 
             // Step 3: soft-tombstone → flushes to L0 (higher run_number than L1 value)
             tree.insert(&key, &tombstone).unwrap();
 
             // Step 4: save snapshot — L0 has tombstone (high run_number),
             //         L1 has original value (low run_number)
-            tree.save_snapshot("snap_with_tombstone", "tombstone in L0").unwrap();
+            tree.save_snapshot("snap_with_tombstone", "tombstone in L0")
+                .unwrap();
         }
 
         // Step 5: restore from snapshot
@@ -1592,7 +1650,10 @@ mod tests {
         // The tombstone (L0, higher run_number) must win over the value (L1, lower run_number)
         let result = tree.get(&key).unwrap();
         assert!(
-            result.as_ref().map(|v| v.as_ref().is_empty()).unwrap_or(false),
+            result
+                .as_ref()
+                .map(|v| v.as_ref().is_empty())
+                .unwrap_or(false),
             "REGRESSION: compacted value resurrected tombstone after restore. \
              Got {:?} — tombstone should have won",
             result.map(|v| v.as_ref().to_vec())

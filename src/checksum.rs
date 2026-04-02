@@ -102,11 +102,11 @@ pub fn parse_checksums_file(content: &str) -> Result<ChecksumsFile, String> {
         }
 
         // Parse line: "CRC32C (filename) = hexvalue"
-        let (filename, hex_value) = parse_checksum_line(line)
-            .map_err(|e| format!("Line {}: {}", line_num + 1, e))?;
+        let (filename, hex_value) =
+            parse_checksum_line(line).map_err(|e| format!("Line {}: {}", line_num + 1, e))?;
 
-        let crc = CRC32C::from_hex(&hex_value)
-            .map_err(|e| format!("Line {}: {}", line_num + 1, e))?;
+        let crc =
+            CRC32C::from_hex(&hex_value).map_err(|e| format!("Line {}: {}", line_num + 1, e))?;
 
         checksums.insert(filename, crc);
     }
@@ -120,13 +120,16 @@ fn parse_checksum_line(line: &str) -> Result<(String, String), String> {
 
     // Check prefix
     if !line.starts_with("CRC32C (") {
-        return Err(format!("Expected line to start with 'CRC32C (', got: {}", line));
+        return Err(format!(
+            "Expected line to start with 'CRC32C (', got: {}",
+            line
+        ));
     }
 
     // Find the closing parenthesis
-    let close_paren = line.find(')').ok_or_else(|| {
-        format!("Expected ')' in line: {}", line)
-    })?;
+    let close_paren = line
+        .find(')')
+        .ok_or_else(|| format!("Expected ')' in line: {}", line))?;
 
     // Extract filename (between "CRC32C (" and ")")
     let filename = &line[8..close_paren]; // 8 = length of "CRC32C ("
@@ -174,8 +177,7 @@ pub fn format_checksums_file(checksums: &ChecksumsFile) -> String {
 /// Read a .checksum file from disk
 pub fn read_checksums_file<P: AsRef<Path>>(path: P) -> io::Result<ChecksumsFile> {
     let content = std::fs::read_to_string(path)?;
-    parse_checksums_file(&content)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    parse_checksums_file(&content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 /// Write a .checksum file to disk
@@ -206,10 +208,7 @@ pub fn write_checksums_file<P: AsRef<Path>>(path: P, checksums: &ChecksumsFile) 
 }
 
 /// Get a specific checksum from a ChecksumsFile
-pub fn get_checksum(
-    checksums_file: &ChecksumsFile,
-    filename: &str,
-) -> Result<CRC32C, String> {
+pub fn get_checksum(checksums_file: &ChecksumsFile, filename: &str) -> Result<CRC32C, String> {
     checksums_file
         .get(filename)
         .copied()
@@ -219,10 +218,7 @@ pub fn get_checksum(
 /// Verify that a file's checksum matches the expected value
 ///
 /// Returns Ok(()) if the checksum matches, otherwise returns an error.
-pub fn check_crc<P: AsRef<Path>>(
-    path: P,
-    expected: CRC32C,
-) -> io::Result<()> {
+pub fn check_crc<P: AsRef<Path>>(path: P, expected: CRC32C) -> io::Result<()> {
     let path = path.as_ref();
     let computed = CRC32C::read_file_crc32c(path)?;
 

@@ -93,11 +93,7 @@ fn test_delete_batch() -> Result<()> {
     tree.insert_batch(entries.clone())?;
 
     // Delete half of them in batch
-    let keys_to_delete: Vec<Key> = entries
-        .iter()
-        .step_by(2)
-        .map(|(k, _)| k.clone())
-        .collect();
+    let keys_to_delete: Vec<Key> = entries.iter().step_by(2).map(|(k, _)| k.clone()).collect();
 
     tree.delete_batch(keys_to_delete.clone())?;
 

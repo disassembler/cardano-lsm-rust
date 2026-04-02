@@ -8,12 +8,12 @@
 //! The LazyLevelling policy is the recommended strategy for blockchain indexing,
 //! balancing write amplification and space amplification.
 
-use crate::{Key, Value, Result};
-use crate::sstable::{SsTableHandle, SsTableWriter, RunNumber};
-use std::path::Path;
+use crate::sstable::{RunNumber, SsTableHandle, SsTableWriter};
+use crate::{Key, Result, Value};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::{Arc, RwLock};
-use serde::{Serialize, Deserialize};
 
 /// Compaction strategy for the LSM tree
 ///
@@ -61,8 +61,7 @@ pub enum CompactionStrategy {
 ///
 /// Selects which SSTables need compaction and executes merge operations
 /// using the LazyLevelling policy.
-pub struct Compactor {
-}
+pub struct Compactor {}
 
 impl Compactor {
     /// Creates a new compactor
@@ -143,7 +142,8 @@ impl Compactor {
             let sstable = &source_level_runs[idx];
 
             // Read all entries including tombstones
-            let entries = sstable.range_with_tombstones(&Key::from(b""), &Key::from([0xFF; 256]))?;
+            let entries =
+                sstable.range_with_tombstones(&Key::from(b""), &Key::from([0xFF; 256]))?;
 
             for (key, value_opt) in entries {
                 // Later (newer) entries overwrite earlier (older) ones
@@ -158,7 +158,8 @@ impl Compactor {
         if is_bottom_level {
             // Leveling: merge with ALL runs in target level, remove tombstones
             for target_run in &job.target_level_runs {
-                let entries = target_run.range_with_tombstones(&Key::from(b""), &Key::from([0xFF; 256]))?;
+                let entries =
+                    target_run.range_with_tombstones(&Key::from(b""), &Key::from([0xFF; 256]))?;
 
                 for (key, value_opt) in entries {
                     // Only insert if not already present (source has priority)
@@ -185,7 +186,10 @@ impl Compactor {
         let mut bytes_written = 0u64;
         for (key, value_opt) in all_entries {
             let key_len = key.as_ref().len() as u64;
-            let value_len = value_opt.as_ref().map(|v| v.as_ref().len() as u64).unwrap_or(0);
+            let value_len = value_opt
+                .as_ref()
+                .map(|v| v.as_ref().len() as u64)
+                .unwrap_or(0);
             bytes_written += key_len + value_len;
             let _ = writer.add(key, value_opt);
         }
@@ -201,7 +205,13 @@ impl Compactor {
     }
 
     /// Execute a compaction job
-    pub fn compact(&self, job: CompactionJob, sstables: &[SsTableHandle], active_dir: &Path, run_number: RunNumber) -> Result<CompactionResult> {
+    pub fn compact(
+        &self,
+        job: CompactionJob,
+        sstables: &[SsTableHandle],
+        active_dir: &Path,
+        run_number: RunNumber,
+    ) -> Result<CompactionResult> {
         // Collect all entries from input SSTables (including tombstones!)
         let mut all_entries: BTreeMap<Key, Option<Value>> = BTreeMap::new();
 
@@ -214,7 +224,8 @@ impl Compactor {
             let sstable = &sstables[idx];
 
             // Read all entries from this SSTable INCLUDING tombstones
-            let entries = sstable.range_with_tombstones(&Key::from(b""), &Key::from([0xFF; 256]))?;
+            let entries =
+                sstable.range_with_tombstones(&Key::from(b""), &Key::from([0xFF; 256]))?;
 
             for (key, value_opt) in entries {
                 // Later (newer) entries overwrite earlier (older) ones (including tombstones)
@@ -242,17 +253,20 @@ impl Compactor {
 
         // Create new SSTable with merged data using new format
         let mut writer = SsTableWriter::new(active_dir, run_number)?;
-        
+
         let mut bytes_written = 0u64;
         for (key, value_opt) in all_entries {
             let key_len = key.as_ref().len() as u64;
-            let value_len = value_opt.as_ref().map(|v| v.as_ref().len() as u64).unwrap_or(0);
+            let value_len = value_opt
+                .as_ref()
+                .map(|v| v.as_ref().len() as u64)
+                .unwrap_or(0);
             bytes_written += key_len + value_len;
             let _ = writer.add(key, value_opt);
         }
 
         let output_handle = writer.finish(0)?;
-        
+
         Ok(CompactionResult {
             output: Some(output_handle),
             inputs_to_remove: job.inputs.clone(),
@@ -403,7 +417,7 @@ pub fn run_compaction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_tiered_grouping() {
         // Test that tiered compaction groups similar-sized tables
@@ -412,11 +426,11 @@ mod tests {
             min_merge_width: 3,
             max_merge_width: 10,
         };
-        
+
         // Would need actual SSTables to test properly
         // This is a placeholder for unit testing
     }
-    
+
     #[test]
     fn test_leveled_selection() {
         // Test that leveled compaction selects appropriate tables
@@ -424,7 +438,7 @@ mod tests {
             size_ratio: 10.0,
             max_level: 7,
         };
-        
+
         // Would need actual SSTables to test properly
     }
 }

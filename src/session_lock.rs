@@ -6,11 +6,11 @@
 // This prevents multiple processes from accessing the same LSM tree
 // simultaneously, which would cause corruption.
 
+use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use serde::{Serialize, Deserialize};
 
 /// Session lock that prevents concurrent access to an LSM tree
 ///
@@ -56,9 +56,7 @@ impl SessionLock {
                         io::ErrorKind::AlreadyExists,
                         format!(
                             "Session locked by PID {} on {} (acquired at timestamp {})",
-                            existing_info.pid,
-                            existing_info.hostname,
-                            existing_info.timestamp
+                            existing_info.pid, existing_info.hostname, existing_info.timestamp
                         ),
                     ));
                 }
@@ -149,8 +147,7 @@ impl SessionLock {
     /// Read lock info from an existing lock file
     fn read_lock_info(path: &Path) -> io::Result<LockInfo> {
         let contents = std::fs::read_to_string(path)?;
-        serde_json::from_str(&contents)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        serde_json::from_str(&contents).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     /// Check if a process with the given PID is still alive
@@ -165,9 +162,9 @@ impl SessionLock {
 
         #[cfg(windows)]
         {
+            use winapi::um::handleapi::CloseHandle;
             use winapi::um::processthreadsapi::OpenProcess;
             use winapi::um::winnt::PROCESS_QUERY_INFORMATION;
-            use winapi::um::handleapi::CloseHandle;
 
             unsafe {
                 let handle = OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid);

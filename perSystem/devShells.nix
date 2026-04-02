@@ -17,27 +17,27 @@
           rust-analyzer
           rustfmt
           clippy
-          
+
           # Haskell toolchain
           ghc
           cabal-install
           haskell-language-server
-          
+
           # Conformance generator (uses local lsm-tree checkout)
           config.packages.conformance-generator
-          
+
           # Task runner
           just
-          
+
           # Utilities
           jq
           fd
           ripgrep
-          
+
           # Tree formatter
           config.treefmt.build.wrapper
         ];
-        
+
         shellHook = ''
           echo "🦀 Cardano LSM Development Environment"
           echo ""

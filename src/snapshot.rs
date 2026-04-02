@@ -4,14 +4,14 @@
 // the snapshots/ directory. They use hard-links to share files with
 // active/ without copying data.
 
-use std::path::{Path, PathBuf};
+use serde::{Deserialize, Serialize};
 use std::io;
-use serde::{Serialize, Deserialize};
+use std::path::{Path, PathBuf};
 
-use crate::sstable::{SsTableHandle, RunNumber};
 use crate::atomic_file::{AtomicFileWriter, fsync_directory};
 use crate::checksum::CRC32C;
-use crate::{Result, Error, LsmConfig};
+use crate::sstable::{RunNumber, SsTableHandle};
+use crate::{Error, LsmConfig, Result};
 
 /// Metadata for a persistent snapshot (CBOR format matching Haskell)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,9 +75,10 @@ impl PersistentSnapshot {
 
         // Check if snapshot already exists
         if snapshot_dir.exists() {
-            return Err(Error::InvalidOperation(
-                format!("Snapshot '{}' already exists", name)
-            ));
+            return Err(Error::InvalidOperation(format!(
+                "Snapshot '{}' already exists",
+                name
+            )));
         }
 
         std::fs::create_dir_all(&snapshot_dir)?;
@@ -93,7 +94,8 @@ impl PersistentSnapshot {
             let run_number = sstable.run_number();
 
             // Create hard-linked copy under the original run_number filename
-            let _linked_handle = sstable.hard_link_to(&snapshot_dir, run_number)
+            let _linked_handle = sstable
+                .hard_link_to(&snapshot_dir, run_number)
                 .map_err(Error::Io)?;
 
             snapshot_runs.push(SnapshotRun {
@@ -144,9 +146,10 @@ impl PersistentSnapshot {
         let snapshot_dir = lsm_path.join("snapshots").join(name);
 
         if !snapshot_dir.exists() {
-            return Err(Error::InvalidOperation(
-                format!("Snapshot '{}' does not exist", name)
-            ));
+            return Err(Error::InvalidOperation(format!(
+                "Snapshot '{}' does not exist",
+                name
+            )));
         }
 
         // Read metadata
@@ -162,9 +165,10 @@ impl PersistentSnapshot {
         let actual_checksum = CRC32C::hash(&metadata_bytes);
 
         if actual_checksum != expected_checksum {
-            return Err(Error::Corruption(
-                format!("Snapshot metadata checksum mismatch for '{}'", name)
-            ));
+            return Err(Error::Corruption(format!(
+                "Snapshot metadata checksum mismatch for '{}'",
+                name
+            )));
         }
 
         // Deserialize metadata
@@ -222,28 +226,64 @@ impl PersistentSnapshot {
             let checksums = crate::checksum::read_checksums_file(&paths.checksums)?;
 
             // Check keyops checksum
-            let keyops_expected = crate::checksum::get_checksum(&checksums, "keyops")
-                .map_err(|e| Error::Corruption(format!("Snapshot '{}' run {}: {}", self.name, run.run_number, e)))?;
-            crate::checksum::check_crc(&paths.keyops, keyops_expected)
-                .map_err(|e| Error::Corruption(format!("Snapshot '{}' run {} keyops checksum failed: {}", self.name, run.run_number, e)))?;
+            let keyops_expected =
+                crate::checksum::get_checksum(&checksums, "keyops").map_err(|e| {
+                    Error::Corruption(format!(
+                        "Snapshot '{}' run {}: {}",
+                        self.name, run.run_number, e
+                    ))
+                })?;
+            crate::checksum::check_crc(&paths.keyops, keyops_expected).map_err(|e| {
+                Error::Corruption(format!(
+                    "Snapshot '{}' run {} keyops checksum failed: {}",
+                    self.name, run.run_number, e
+                ))
+            })?;
 
             // Check blobs checksum
-            let blobs_expected = crate::checksum::get_checksum(&checksums, "blobs")
-                .map_err(|e| Error::Corruption(format!("Snapshot '{}' run {}: {}", self.name, run.run_number, e)))?;
-            crate::checksum::check_crc(&paths.blobs, blobs_expected)
-                .map_err(|e| Error::Corruption(format!("Snapshot '{}' run {} blobs checksum failed: {}", self.name, run.run_number, e)))?;
+            let blobs_expected =
+                crate::checksum::get_checksum(&checksums, "blobs").map_err(|e| {
+                    Error::Corruption(format!(
+                        "Snapshot '{}' run {}: {}",
+                        self.name, run.run_number, e
+                    ))
+                })?;
+            crate::checksum::check_crc(&paths.blobs, blobs_expected).map_err(|e| {
+                Error::Corruption(format!(
+                    "Snapshot '{}' run {} blobs checksum failed: {}",
+                    self.name, run.run_number, e
+                ))
+            })?;
 
             // Check filter checksum
-            let filter_expected = crate::checksum::get_checksum(&checksums, "filter")
-                .map_err(|e| Error::Corruption(format!("Snapshot '{}' run {}: {}", self.name, run.run_number, e)))?;
-            crate::checksum::check_crc(&paths.filter, filter_expected)
-                .map_err(|e| Error::Corruption(format!("Snapshot '{}' run {} filter checksum failed: {}", self.name, run.run_number, e)))?;
+            let filter_expected =
+                crate::checksum::get_checksum(&checksums, "filter").map_err(|e| {
+                    Error::Corruption(format!(
+                        "Snapshot '{}' run {}: {}",
+                        self.name, run.run_number, e
+                    ))
+                })?;
+            crate::checksum::check_crc(&paths.filter, filter_expected).map_err(|e| {
+                Error::Corruption(format!(
+                    "Snapshot '{}' run {} filter checksum failed: {}",
+                    self.name, run.run_number, e
+                ))
+            })?;
 
             // Check index checksum
-            let index_expected = crate::checksum::get_checksum(&checksums, "index")
-                .map_err(|e| Error::Corruption(format!("Snapshot '{}' run {}: {}", self.name, run.run_number, e)))?;
-            crate::checksum::check_crc(&paths.index, index_expected)
-                .map_err(|e| Error::Corruption(format!("Snapshot '{}' run {} index checksum failed: {}", self.name, run.run_number, e)))?;
+            let index_expected =
+                crate::checksum::get_checksum(&checksums, "index").map_err(|e| {
+                    Error::Corruption(format!(
+                        "Snapshot '{}' run {}: {}",
+                        self.name, run.run_number, e
+                    ))
+                })?;
+            crate::checksum::check_crc(&paths.index, index_expected).map_err(|e| {
+                Error::Corruption(format!(
+                    "Snapshot '{}' run {} index checksum failed: {}",
+                    self.name, run.run_number, e
+                ))
+            })?;
         }
 
         Ok(())
@@ -282,9 +322,9 @@ pub fn list_snapshots(lsm_path: &Path) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
-    use crate::{Key, Value};
     use crate::sstable::SsTableWriter;
+    use crate::{Key, Value};
+    use tempfile::TempDir;
 
     #[test]
     fn test_create_and_load_snapshot() -> Result<()> {
@@ -306,14 +346,8 @@ mod tests {
         let config = LsmConfig::default();
 
         // Create snapshot
-        let snapshot = PersistentSnapshot::create(
-            lsm_path,
-            "snap1",
-            "Test snapshot",
-            &sstables,
-            42,
-            &config,
-        )?;
+        let snapshot =
+            PersistentSnapshot::create(lsm_path, "snap1", "Test snapshot", &sstables, 42, &config)?;
 
         assert_eq!(snapshot.name, "snap1");
         assert_eq!(snapshot.metadata.label, "Test snapshot");
@@ -414,14 +448,8 @@ mod tests {
         let config = LsmConfig::default();
 
         // Create snapshot
-        let snapshot = PersistentSnapshot::create(
-            lsm_path,
-            "snap1",
-            "Test snapshot",
-            &sstables,
-            42,
-            &config,
-        )?;
+        let snapshot =
+            PersistentSnapshot::create(lsm_path, "snap1", "Test snapshot", &sstables, 42, &config)?;
 
         // Validation should succeed initially
         assert!(snapshot.validate().is_ok());
@@ -467,14 +495,8 @@ mod tests {
         let config = LsmConfig::default();
 
         // Create snapshot
-        let snapshot = PersistentSnapshot::create(
-            lsm_path,
-            "snap1",
-            "Test snapshot",
-            &sstables,
-            42,
-            &config,
-        )?;
+        let snapshot =
+            PersistentSnapshot::create(lsm_path, "snap1", "Test snapshot", &sstables, 42, &config)?;
 
         // Validation should succeed initially
         assert!(snapshot.validate().is_ok());

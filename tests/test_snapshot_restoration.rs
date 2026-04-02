@@ -6,7 +6,7 @@
 // 3. Data is correctly restored
 // 4. Snapshot SSTable files survive open_snapshot + drop (regression for destruction bug)
 
-use cardano_lsm::{LsmTree, LsmConfig, Key, Value};
+use cardano_lsm::{Key, LsmConfig, LsmTree, Value};
 use tempfile::TempDir;
 
 #[test]
@@ -18,9 +18,12 @@ fn test_snapshot_save_and_restore() {
     {
         let mut tree = LsmTree::open(db_path, LsmConfig::default()).unwrap();
 
-        tree.insert(&Key::from(b"key1"), &Value::from(b"value1")).unwrap();
-        tree.insert(&Key::from(b"key2"), &Value::from(b"value2")).unwrap();
-        tree.insert(&Key::from(b"key3"), &Value::from(b"value3")).unwrap();
+        tree.insert(&Key::from(b"key1"), &Value::from(b"value1"))
+            .unwrap();
+        tree.insert(&Key::from(b"key2"), &Value::from(b"value2"))
+            .unwrap();
+        tree.insert(&Key::from(b"key3"), &Value::from(b"value3"))
+            .unwrap();
 
         // Save snapshot
         tree.save_snapshot("test_snap", "Test snapshot").unwrap();
@@ -54,8 +57,10 @@ fn test_snapshot_restore_with_more_writes() {
     {
         let mut tree = LsmTree::open(db_path, LsmConfig::default()).unwrap();
 
-        tree.insert(&Key::from(b"key1"), &Value::from(b"value1")).unwrap();
-        tree.insert(&Key::from(b"key2"), &Value::from(b"value2")).unwrap();
+        tree.insert(&Key::from(b"key1"), &Value::from(b"value1"))
+            .unwrap();
+        tree.insert(&Key::from(b"key2"), &Value::from(b"value2"))
+            .unwrap();
 
         tree.save_snapshot("snap1", "First snapshot").unwrap();
     }
@@ -71,8 +76,10 @@ fn test_snapshot_restore_with_more_writes() {
         );
 
         // Add new data
-        tree.insert(&Key::from(b"key3"), &Value::from(b"value3")).unwrap();
-        tree.insert(&Key::from(b"key4"), &Value::from(b"value4")).unwrap();
+        tree.insert(&Key::from(b"key3"), &Value::from(b"value3"))
+            .unwrap();
+        tree.insert(&Key::from(b"key4"), &Value::from(b"value4"))
+            .unwrap();
 
         // Save another snapshot
         tree.save_snapshot("snap2", "Second snapshot").unwrap();
@@ -123,7 +130,8 @@ fn test_snapshot_list_after_restore() {
     // Create and save snapshots
     {
         let mut tree = LsmTree::open(db_path, LsmConfig::default()).unwrap();
-        tree.insert(&Key::from(b"key1"), &Value::from(b"value1")).unwrap();
+        tree.insert(&Key::from(b"key1"), &Value::from(b"value1"))
+            .unwrap();
         tree.save_snapshot("snap1", "First").unwrap();
         tree.save_snapshot("snap2", "Second").unwrap();
     }
@@ -173,8 +181,10 @@ fn test_snapshot_files_survive_open_and_drop() {
         .map(|e| e.file_name())
         .filter(|n| {
             let s = n.to_string_lossy();
-            s.ends_with(".keyops") || s.ends_with(".blobs")
-                || s.ends_with(".filter") || s.ends_with(".index")
+            s.ends_with(".keyops")
+                || s.ends_with(".blobs")
+                || s.ends_with(".filter")
+                || s.ends_with(".index")
                 || s.ends_with(".checksums")
         })
         .collect();
@@ -200,8 +210,10 @@ fn test_snapshot_files_survive_open_and_drop() {
             .map(|e| e.file_name())
             .filter(|n| {
                 let s = n.to_string_lossy();
-                s.ends_with(".keyops") || s.ends_with(".blobs")
-                    || s.ends_with(".filter") || s.ends_with(".index")
+                s.ends_with(".keyops")
+                    || s.ends_with(".blobs")
+                    || s.ends_with(".filter")
+                    || s.ends_with(".index")
                     || s.ends_with(".checksums")
             })
             .collect();

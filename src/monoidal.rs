@@ -27,10 +27,10 @@
 //! # }
 //! ```
 
-use crate::{LsmTree, LsmConfig, LsmSnapshot, Key, Value, Result};
-use serde::{Serialize, Deserialize};
-use std::path::Path;
+use crate::{Key, LsmConfig, LsmSnapshot, LsmTree, Result, Value};
+use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
+use std::path::Path;
 
 /// Values that can be combined with an associative operation (monoid)
 ///
@@ -293,7 +293,7 @@ impl<V: Monoidal> MonoidalSnapshot<V> {
     /// The aggregated result of combining all values in the range.
     pub fn range_fold(&self, from: &Key, to: &Key) -> V {
         let mut accumulator = V::mempty();
-        
+
         // Use the snapshot's iter to get all entries
         for (key, value_bytes) in self.inner.iter() {
             if &key >= from && &key <= to {
@@ -302,7 +302,7 @@ impl<V: Monoidal> MonoidalSnapshot<V> {
                 }
             }
         }
-        
+
         accumulator
     }
 }
@@ -314,7 +314,7 @@ impl Monoidal for u64 {
     fn mempty() -> Self {
         0
     }
-    
+
     fn mappend(&self, other: &Self) -> Self {
         self.saturating_add(*other)
     }
@@ -325,7 +325,7 @@ impl Monoidal for i64 {
     fn mempty() -> Self {
         0
     }
-    
+
     fn mappend(&self, other: &Self) -> Self {
         self.saturating_add(*other)
     }
@@ -336,7 +336,7 @@ impl<T: Clone + Send + Sync + Serialize + for<'de> Deserialize<'de>> Monoidal fo
     fn mempty() -> Self {
         Vec::new()
     }
-    
+
     fn mappend(&self, other: &Self) -> Self {
         let mut result = self.clone();
         result.extend_from_slice(other);
@@ -353,7 +353,7 @@ where
     fn mempty() -> Self {
         std::collections::HashMap::new()
     }
-    
+
     fn mappend(&self, other: &Self) -> Self {
         let mut result = self.clone();
         for (k, v) in other {
@@ -368,42 +368,42 @@ where
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    
+
     #[test]
     fn test_u64_monoidal_laws() {
         // Identity
         assert_eq!(0u64.mappend(&42), 42);
         assert_eq!(42u64.mappend(&0), 42);
-        
+
         // Associativity
         let a = 10u64;
         let b = 20u64;
         let c = 30u64;
         assert_eq!(a.mappend(&b).mappend(&c), a.mappend(&b.mappend(&c)));
     }
-    
+
     #[test]
     fn test_monoidal_lsm_basic() {
         let temp = TempDir::new().unwrap();
         let mut tree = MonoidalLsmTree::<u64>::open(temp.path(), LsmConfig::default()).unwrap();
-        
+
         tree.insert(&Key::from(b"balance1"), &100).unwrap();
         tree.insert(&Key::from(b"balance2"), &200).unwrap();
-        
+
         assert_eq!(tree.get(&Key::from(b"balance1")).unwrap(), 100);
         assert_eq!(tree.get(&Key::from(b"balance2")).unwrap(), 200);
     }
-    
+
     #[test]
     fn test_range_fold() {
         let temp = TempDir::new().unwrap();
         let mut tree = MonoidalLsmTree::<u64>::open(temp.path(), LsmConfig::default()).unwrap();
-        
+
         tree.insert(&Key::from(b"addr_a"), &100).unwrap();
         tree.insert(&Key::from(b"addr_b"), &200).unwrap();
         tree.insert(&Key::from(b"addr_c"), &300).unwrap();
         tree.insert(&Key::from(b"addr_d"), &400).unwrap();
-        
+
         let total = tree.range_fold(&Key::from(b"addr_b"), &Key::from(b"addr_c"));
         assert_eq!(total, 500); // 200 + 300
     }

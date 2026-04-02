@@ -1,4 +1,4 @@
-use cardano_lsm::{LsmTree, LsmConfig, Key, Value};
+use cardano_lsm::{Key, LsmConfig, LsmTree, Value};
 use tempfile::TempDir;
 
 #[test]
@@ -32,9 +32,11 @@ fn test_range_query_with_deleted_key() {
 
     println!("Range query results: {:?}", results.len());
     for (k, v) in &results {
-        println!("  Key: {:?}, Value: {:?}",
+        println!(
+            "  Key: {:?}, Value: {:?}",
             String::from_utf8_lossy(k.as_ref()),
-            String::from_utf8_lossy(v.as_ref()));
+            String::from_utf8_lossy(v.as_ref())
+        );
     }
 
     // BUG: The deleted key appears in results!

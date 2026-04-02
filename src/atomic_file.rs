@@ -66,7 +66,8 @@ impl AtomicFileWriter {
 
     /// Write data to the file
     pub fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
-        self.file.as_mut()
+        self.file
+            .as_mut()
             .ok_or_else(|| io::Error::other("Writer already closed"))?
             .write_all(data)
     }
@@ -81,7 +82,9 @@ impl AtomicFileWriter {
     ///
     /// After this, the file is durably on disk.
     pub fn commit(mut self) -> io::Result<()> {
-        let mut file = self.file.take()
+        let mut file = self
+            .file
+            .take()
             .ok_or_else(|| io::Error::other("Writer already closed"))?;
 
         // 1. Flush buffer

@@ -10,18 +10,18 @@
 // This matches the Haskell implementation's multi-file format,
 // with external checksums for corruption detection.
 
+use byteorder::{LittleEndian, ReadBytesExt};
+use serde::{Deserialize, Serialize};
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use serde::{Serialize, Deserialize};
-use byteorder::{LittleEndian, ReadBytesExt};
 
+use crate::atomic_file::fsync_directory;
 use crate::checksum::ChecksumsFile;
 use crate::checksum_handle::ChecksumHandle;
-use crate::atomic_file::fsync_directory;
 use crate::io_backend::{self, IoBackend};
-use crate::{Key, Value, Result, Error};
+use crate::{Error, Key, Result, Value};
 
 /// Run number for identifying a set of SSTable files
 pub type RunNumber = u64;
@@ -95,11 +95,9 @@ impl SsTableWriter {
         let paths = RunPaths::new(active_dir, run_number);
 
         // Create temporary files for writing
-        let keyops_writer = ChecksumHandle::create(&paths.keyops)
-            .map_err(Error::Io)?;
+        let keyops_writer = ChecksumHandle::create(&paths.keyops).map_err(Error::Io)?;
 
-        let blobs_writer = ChecksumHandle::create(&paths.blobs)
-            .map_err(Error::Io)?;
+        let blobs_writer = ChecksumHandle::create(&paths.blobs).map_err(Error::Io)?;
 
         Ok(Self {
             run_number,
@@ -134,7 +132,9 @@ impl SsTableWriter {
     /// Returns a handle to the completed SSTable.
     pub fn finish(mut self, level: u8) -> Result<SsTableHandle> {
         if self.entries.is_empty() {
-            return Err(Error::InvalidOperation("Cannot create empty SSTable".to_string()));
+            return Err(Error::InvalidOperation(
+                "Cannot create empty SSTable".to_string(),
+            ));
         }
 
         // Sort entries by key
@@ -153,7 +153,8 @@ impl SsTableWriter {
 
             // Write key
             let key_bytes = key.as_ref();
-            self.keyops_writer.write_all(&(key_bytes.len() as u32).to_le_bytes())?;
+            self.keyops_writer
+                .write_all(&(key_bytes.len() as u32).to_le_bytes())?;
             self.keyops_writer.write_all(key_bytes)?;
 
             // Write operation (Insert=1, Delete=0) and value
@@ -165,7 +166,8 @@ impl SsTableWriter {
                     let value_len = value_bytes.len() as u64;
 
                     // Write blob offset and size to keyops
-                    self.keyops_writer.write_all(&self.blob_offset.to_le_bytes())?;
+                    self.keyops_writer
+                        .write_all(&self.blob_offset.to_le_bytes())?;
                     self.keyops_writer.write_all(&value_len.to_le_bytes())?;
 
                     // Write value to blobs
@@ -191,25 +193,31 @@ impl SsTableWriter {
         // Build bloom filter
         let bloom_filter = BloomFilter::from_keys(
             self.entries.iter().map(|(k, _)| k.as_ref()),
-            10, // bits per key
+            10,   // bits per key
             0.01, // false positive rate
         );
 
         // Write filter file
-        let filter_bytes = bincode::serialize(&bloom_filter)
-            .map_err(|e| Error::Serialization(e.to_string()))?;
-        let filter_crc = crate::checksum_handle::write_file_with_checksum(&self.paths.filter, &filter_bytes)?;
+        let filter_bytes =
+            bincode::serialize(&bloom_filter).map_err(|e| Error::Serialization(e.to_string()))?;
+        let filter_crc =
+            crate::checksum_handle::write_file_with_checksum(&self.paths.filter, &filter_bytes)?;
 
         // Build index with keys and their keyops file offsets for direct seek
         let index = Index {
-            keys: self.entries.iter().map(|(k, _)| k.as_ref().to_vec()).collect(),
+            keys: self
+                .entries
+                .iter()
+                .map(|(k, _)| k.as_ref().to_vec())
+                .collect(),
             keyops_offsets,
         };
 
         // Write index file
-        let index_bytes = bincode::serialize(&index)
-            .map_err(|e| Error::Serialization(e.to_string()))?;
-        let index_crc = crate::checksum_handle::write_file_with_checksum(&self.paths.index, &index_bytes)?;
+        let index_bytes =
+            bincode::serialize(&index).map_err(|e| Error::Serialization(e.to_string()))?;
+        let index_crc =
+            crate::checksum_handle::write_file_with_checksum(&self.paths.index, &index_bytes)?;
 
         // Write checksums file
         let mut checksums = ChecksumsFile::new();
@@ -251,7 +259,7 @@ pub struct SsTableHandle {
     pub min_key: Key,
     pub max_key: Key,
     pub num_entries: u64,
-    pub level: u8,  // 0 = L0 (fresh flushes), 1-6 = L1-L6
+    pub level: u8, // 0 = L0 (fresh flushes), 1-6 = L1-L6
     bloom_filter: BloomFilter,
     index: Index,
 
@@ -301,23 +309,23 @@ impl SsTableHandle {
         let checksums = crate::checksum::read_checksums_file(&paths.checksums)?;
 
         // Verify keyops checksum
-        let keyops_expected = crate::checksum::get_checksum(&checksums, "keyops")
-            .map_err(Error::Corruption)?;
+        let keyops_expected =
+            crate::checksum::get_checksum(&checksums, "keyops").map_err(Error::Corruption)?;
         crate::checksum::check_crc(&paths.keyops, keyops_expected)?;
 
         // Verify blobs checksum
-        let blobs_expected = crate::checksum::get_checksum(&checksums, "blobs")
-            .map_err(Error::Corruption)?;
+        let blobs_expected =
+            crate::checksum::get_checksum(&checksums, "blobs").map_err(Error::Corruption)?;
         crate::checksum::check_crc(&paths.blobs, blobs_expected)?;
 
         // Verify filter checksum
-        let filter_expected = crate::checksum::get_checksum(&checksums, "filter")
-            .map_err(Error::Corruption)?;
+        let filter_expected =
+            crate::checksum::get_checksum(&checksums, "filter").map_err(Error::Corruption)?;
         crate::checksum::check_crc(&paths.filter, filter_expected)?;
 
         // Verify index checksum
-        let index_expected = crate::checksum::get_checksum(&checksums, "index")
-            .map_err(Error::Corruption)?;
+        let index_expected =
+            crate::checksum::get_checksum(&checksums, "index").map_err(Error::Corruption)?;
         crate::checksum::check_crc(&paths.index, index_expected)?;
 
         // All checksums verified, now read the data
@@ -326,13 +334,13 @@ impl SsTableHandle {
 
         // Read bloom filter
         let filter_bytes = io_backend::read_file(&paths.filter, &backend)?;
-        let bloom_filter: BloomFilter = bincode::deserialize(&filter_bytes)
-            .map_err(|e| Error::Serialization(e.to_string()))?;
+        let bloom_filter: BloomFilter =
+            bincode::deserialize(&filter_bytes).map_err(|e| Error::Serialization(e.to_string()))?;
 
         // Read index
         let index_bytes = io_backend::read_file(&paths.index, &backend)?;
-        let index: Index = bincode::deserialize(&index_bytes)
-            .map_err(|e| Error::Serialization(e.to_string()))?;
+        let index: Index =
+            bincode::deserialize(&index_bytes).map_err(|e| Error::Serialization(e.to_string()))?;
 
         // Determine min/max keys from index
         let min_key = Key::from(&index.keys.first().unwrap()[..]);
@@ -344,7 +352,7 @@ impl SsTableHandle {
             min_key,
             max_key,
             num_entries,
-            level: 0,  // Default to L0 for existing SSTables without level metadata
+            level: 0, // Default to L0 for existing SSTables without level metadata
             bloom_filter,
             index,
             refcount: Arc::new(AtomicUsize::new(1)), // Initial refcount = 1
@@ -374,7 +382,11 @@ impl SsTableHandle {
 
         // Binary search in index for exact key position
         let key_bytes = key.as_ref();
-        let pos = match self.index.keys.binary_search_by(|k| k.as_slice().cmp(key_bytes)) {
+        let pos = match self
+            .index
+            .keys
+            .binary_search_by(|k| k.as_slice().cmp(key_bytes))
+        {
             Ok(pos) => pos,
             Err(_) => return Ok(None),
         };
@@ -383,13 +395,9 @@ impl SsTableHandle {
         if let Some(&keyops_offset) = self.index.keyops_offsets.get(pos) {
             // Read: 4 (key_len field) + key_len + 1 (op byte) bytes
             let prefix_len = 4 + key_bytes.len() + 1;
-            let prefix = io_backend::read_range(
-                &self.paths.keyops,
-                keyops_offset,
-                prefix_len,
-                backend,
-            )
-            .map_err(Error::Io)?;
+            let prefix =
+                io_backend::read_range(&self.paths.keyops, keyops_offset, prefix_len, backend)
+                    .map_err(Error::Io)?;
             let op = prefix[prefix_len - 1];
 
             if op == 0 {
@@ -429,13 +437,21 @@ impl SsTableHandle {
     }
 
     /// Range query using specific I/O backend
-    pub fn range_backend(&self, from: &Key, to: &Key, backend: &IoBackend) -> Result<Vec<(Key, Option<Value>)>> {
+    pub fn range_backend(
+        &self,
+        from: &Key,
+        to: &Key,
+        backend: &IoBackend,
+    ) -> Result<Vec<(Key, Option<Value>)>> {
         let all_entries = self.range_with_tombstones_backend(from, to, backend)?;
 
         // Filter out tombstones (None values that represent deletes)
         // But keep None values that come from Insert operations
         // Actually, for range queries, we want to exclude deleted keys entirely
-        Ok(all_entries.into_iter().filter(|(_, v)| v.is_some()).collect())
+        Ok(all_entries
+            .into_iter()
+            .filter(|(_, v)| v.is_some())
+            .collect())
     }
 
     /// Range query with tombstones - needed for compaction
@@ -448,7 +464,12 @@ impl SsTableHandle {
     /// Range query with tombstones using specific I/O backend
     ///
     /// This allows using io_uring for async I/O on Linux.
-    pub fn range_with_tombstones_backend(&self, from: &Key, to: &Key, backend: &IoBackend) -> Result<Vec<(Key, Option<Value>)>> {
+    pub fn range_with_tombstones_backend(
+        &self,
+        from: &Key,
+        to: &Key,
+        backend: &IoBackend,
+    ) -> Result<Vec<(Key, Option<Value>)>> {
         // Read the entire keyops file
         let keyops_data = io_backend::read_file(&self.paths.keyops, backend)?;
         let mut cursor = std::io::Cursor::new(&keyops_data);
@@ -567,7 +588,7 @@ impl SsTableHandle {
             min_key: self.min_key.clone(),
             max_key: self.max_key.clone(),
             num_entries: self.num_entries,
-            level: self.level,  // Preserve level
+            level: self.level, // Preserve level
             bloom_filter: self.bloom_filter.clone(),
             index: self.index.clone(),
             refcount: Arc::clone(&self.refcount), // Share refcount
@@ -606,9 +627,10 @@ impl SsTableHandle {
         }
 
         if !errors.is_empty() {
-            return Err(io::Error::other(
-                format!("Failed to delete SSTable files: {}", errors.join(", ")),
-            ));
+            return Err(io::Error::other(format!(
+                "Failed to delete SSTable files: {}",
+                errors.join(", ")
+            )));
         }
 
         Ok(())
@@ -651,7 +673,7 @@ impl Clone for SsTableHandle {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct BloomFilter {
     bits: Vec<u8>,
-    num_bits: usize,  // Total number of bits (not bytes!)
+    num_bits: usize, // Total number of bits (not bytes!)
     num_hashes: u32,
 }
 
@@ -674,7 +696,11 @@ impl BloomFilter {
             }
         }
 
-        Self { bits, num_bits, num_hashes }
+        Self {
+            bits,
+            num_bits,
+            num_hashes,
+        }
     }
 
     fn might_contain(&self, key: &[u8]) -> bool {
@@ -702,7 +728,7 @@ impl BloomFilter {
 struct Index {
     keys: Vec<Vec<u8>>,
     #[serde(default)]
-    keyops_offsets: Vec<u64>,  // byte offset of each key's entry in the keyops file
+    keyops_offsets: Vec<u64>, // byte offset of each key's entry in the keyops file
 }
 
 #[cfg(test)]
@@ -733,7 +759,13 @@ mod tests {
         assert!(paths.blobs.to_str().unwrap().contains("00042.blobs"));
         assert!(paths.filter.to_str().unwrap().contains("00042.filter"));
         assert!(paths.index.to_str().unwrap().contains("00042.index"));
-        assert!(paths.checksums.to_str().unwrap().contains("00042.checksums"));
+        assert!(
+            paths
+                .checksums
+                .to_str()
+                .unwrap()
+                .contains("00042.checksums")
+        );
     }
 
     #[test]
@@ -784,7 +816,8 @@ mod tests {
         let handle1 = writer.finish(0)?;
 
         // Hard-link to snapshot directory
-        let handle2 = handle1.hard_link_to(&snapshot_dir, 100)
+        let handle2 = handle1
+            .hard_link_to(&snapshot_dir, 100)
             .map_err(Error::Io)?;
 
         // Both sets of files should exist
@@ -857,12 +890,9 @@ mod tests {
         let snap2_dir = dir.path().join("snap2");
         let snap3_dir = dir.path().join("snap3");
 
-        let handle2 = handle1.hard_link_to(&snap1_dir, 100)
-            .map_err(Error::Io)?;
-        let handle3 = handle1.hard_link_to(&snap2_dir, 200)
-            .map_err(Error::Io)?;
-        let handle4 = handle1.hard_link_to(&snap3_dir, 300)
-            .map_err(Error::Io)?;
+        let handle2 = handle1.hard_link_to(&snap1_dir, 100).map_err(Error::Io)?;
+        let handle3 = handle1.hard_link_to(&snap2_dir, 200).map_err(Error::Io)?;
+        let handle4 = handle1.hard_link_to(&snap3_dir, 300).map_err(Error::Io)?;
 
         // Refcount should be 4
         assert_eq!(handle1.refcount.load(Ordering::SeqCst), 4);

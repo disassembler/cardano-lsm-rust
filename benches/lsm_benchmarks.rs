@@ -1,8 +1,8 @@
 // Benchmarks for Cardano LSM Tree
 // Measures performance of core operations and Cardano-specific patterns
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
-use cardano_lsm::{LsmTree, LsmConfig, Key, Value, IncrementalMerkleTree, MonoidalLsmTree};
+use cardano_lsm::{IncrementalMerkleTree, Key, LsmConfig, LsmTree, MonoidalLsmTree, Value};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use tempfile::TempDir;
 
 fn create_tree() -> (LsmTree, TempDir) {
@@ -22,7 +22,7 @@ fn create_tree_with_config(config: LsmConfig) -> (LsmTree, TempDir) {
 
 fn bench_insert(c: &mut Criterion) {
     let mut group = c.benchmark_group("insert");
-    
+
     for size in [100, 1000, 10_000] {
         group.throughput(Throughput::Elements(size));
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &n| {
@@ -35,7 +35,7 @@ fn bench_insert(c: &mut Criterion) {
                         tree.insert(&key, &value).unwrap();
                     }
                 },
-                criterion::BatchSize::SmallInput
+                criterion::BatchSize::SmallInput,
             );
         });
     }
@@ -44,7 +44,7 @@ fn bench_insert(c: &mut Criterion) {
 
 fn bench_get(c: &mut Criterion) {
     let mut group = c.benchmark_group("get");
-    
+
     for size in [100, 1000, 10_000] {
         group.throughput(Throughput::Elements(size));
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &n| {
@@ -63,7 +63,7 @@ fn bench_get(c: &mut Criterion) {
                         tree.get(&key).unwrap();
                     }
                 },
-                criterion::BatchSize::SmallInput
+                criterion::BatchSize::SmallInput,
             );
         });
     }
@@ -72,28 +72,32 @@ fn bench_get(c: &mut Criterion) {
 
 fn bench_range(c: &mut Criterion) {
     let mut group = c.benchmark_group("range_scan");
-    
+
     for range_size in [10, 100, 1000] {
         group.throughput(Throughput::Elements(range_size));
-        group.bench_with_input(BenchmarkId::from_parameter(range_size), &range_size, |b, &n| {
-            b.iter_batched(
-                || {
-                    let (mut tree, temp) = create_tree();
-                    for i in 0..10_000 {
-                        let key = Key::from(format!("key_{:08}", i).as_bytes());
-                        tree.insert(&key, &Value::from(b"value")).unwrap();
-                    }
-                    (tree, temp)
-                },
-                |(tree, _temp)| {
-                    let from = Key::from(b"key_00000000");
-                    let to = Key::from(format!("key_{:08}", n).as_bytes());
-                    let count = tree.range(&from, &to).count();
-                    black_box(count);
-                },
-                criterion::BatchSize::SmallInput
-            );
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(range_size),
+            &range_size,
+            |b, &n| {
+                b.iter_batched(
+                    || {
+                        let (mut tree, temp) = create_tree();
+                        for i in 0..10_000 {
+                            let key = Key::from(format!("key_{:08}", i).as_bytes());
+                            tree.insert(&key, &Value::from(b"value")).unwrap();
+                        }
+                        (tree, temp)
+                    },
+                    |(tree, _temp)| {
+                        let from = Key::from(b"key_00000000");
+                        let to = Key::from(format!("key_{:08}", n).as_bytes());
+                        let count = tree.range(&from, &to).count();
+                        black_box(count);
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
+            },
+        );
     }
     group.finish();
 }
@@ -102,7 +106,7 @@ fn bench_range(c: &mut Criterion) {
 
 fn bench_snapshot(c: &mut Criterion) {
     let mut group = c.benchmark_group("snapshot");
-    
+
     for size in [1_000, 10_000, 100_000] {
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &n| {
             b.iter_batched(
@@ -118,7 +122,7 @@ fn bench_snapshot(c: &mut Criterion) {
                     let snapshot = tree.snapshot();
                     black_box(snapshot);
                 },
-                criterion::BatchSize::SmallInput
+                criterion::BatchSize::SmallInput,
             );
         });
     }
@@ -127,25 +131,27 @@ fn bench_snapshot(c: &mut Criterion) {
 
 fn bench_rollback(c: &mut Criterion) {
     let mut group = c.benchmark_group("rollback");
-    
+
     for size in [1_000, 10_000, 100_000] {
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &n| {
             b.iter_batched(
                 || {
                     let (mut tree, temp) = create_tree();
                     for i in 0..n {
-                        tree.insert(&Key::from(format!("k{}", i).as_bytes()), &Value::from(b"v")).unwrap();
+                        tree.insert(&Key::from(format!("k{}", i).as_bytes()), &Value::from(b"v"))
+                            .unwrap();
                     }
                     let snap = tree.snapshot();
                     for i in 0..100 {
-                        tree.delete(&Key::from(format!("k{}", i).as_bytes())).unwrap();
+                        tree.delete(&Key::from(format!("k{}", i).as_bytes()))
+                            .unwrap();
                     }
                     (tree, snap, temp)
                 },
                 |(mut tree, snap, _temp)| {
                     tree.rollback(snap).unwrap();
                 },
-                criterion::BatchSize::SmallInput
+                criterion::BatchSize::SmallInput,
             );
         });
     }
@@ -156,7 +162,7 @@ fn bench_rollback(c: &mut Criterion) {
 
 fn bench_cardano_utxo(c: &mut Criterion) {
     let mut group = c.benchmark_group("cardano_utxo");
-    
+
     group.bench_function("address_balance_query", |b| {
         b.iter_batched(
             || {
@@ -175,16 +181,16 @@ fn bench_cardano_utxo(c: &mut Criterion) {
                 let count = tree.scan_prefix(b"addr_0500#").count();
                 black_box(count);
             },
-            criterion::BatchSize::SmallInput
+            criterion::BatchSize::SmallInput,
         );
     });
-    
+
     group.finish();
 }
 
 fn bench_cardano_governance(c: &mut Criterion) {
     let mut group = c.benchmark_group("cardano_governance");
-    
+
     group.bench_function("merkle_insert_1000_actions", |b| {
         b.iter(|| {
             let mut merkle = IncrementalMerkleTree::new(16);
@@ -195,20 +201,25 @@ fn bench_cardano_governance(c: &mut Criterion) {
             black_box(merkle);
         });
     });
-    
+
     group.finish();
 }
 
 fn bench_monoidal_balance(c: &mut Criterion) {
     let mut group = c.benchmark_group("monoidal_balance");
-    
+
     group.bench_function("aggregate_1000_balances", |b| {
         b.iter_batched(
             || {
                 let temp = TempDir::new().unwrap();
-                let mut tree = MonoidalLsmTree::<u64>::open(temp.path(), LsmConfig::default()).unwrap();
+                let mut tree =
+                    MonoidalLsmTree::<u64>::open(temp.path(), LsmConfig::default()).unwrap();
                 for i in 0..1000 {
-                    tree.insert(&Key::from(format!("bal{}", i).as_bytes()), &(i as u64 * 1_000_000)).unwrap();
+                    tree.insert(
+                        &Key::from(format!("bal{}", i).as_bytes()),
+                        &(i as u64 * 1_000_000),
+                    )
+                    .unwrap();
                 }
                 (tree, temp)
             },
@@ -216,10 +227,10 @@ fn bench_monoidal_balance(c: &mut Criterion) {
                 let total = tree.prefix_fold(b"bal");
                 black_box(total);
             },
-            criterion::BatchSize::SmallInput
+            criterion::BatchSize::SmallInput,
         );
     });
-    
+
     group.finish();
 }
 
