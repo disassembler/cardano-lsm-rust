@@ -691,12 +691,16 @@ impl LsmTree {
         fsync_directory(&active_dir)?;
 
         // Open SSTables from active/ (never from the snapshot directory).
+        // Restore each handle's level from the snapshot metadata so that the
+        // level structure (and therefore compaction behaviour) is preserved.
         let mut all_sstables = Vec::new();
         let mut max_run_number = 0u64;
 
         for run in &snapshot.metadata.runs {
             match SsTableHandle::open(&active_dir, run.run_number) {
-                Ok(handle) => {
+                Ok(mut handle) => {
+                    // Restore the original level; SsTableHandle::open() defaults to 0.
+                    handle.level = run.level;
                     all_sstables.push(handle);
                     max_run_number = max_run_number.max(run.run_number);
                 }
@@ -1487,5 +1491,121 @@ pub struct LsmStats {
 }
 
 // End of lib.rs
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn tiny_config() -> LsmConfig {
+        LsmConfig {
+            // Tiny memtable so a single insert flushes to L0 immediately.
+            // Trigger of 1 so compact() fires even with a single L0 SSTable.
+            memtable_size: 1,
+            level0_compaction_trigger: 1,
+            ..LsmConfig::default()
+        }
+    }
+
+    /// Hayate uses `insert(key, empty_bytes)` as a soft tombstone (not `delete()`).
+    /// After a snapshot save + restore, a soft-tombstoned key must NOT resurface.
+    ///
+    /// Basic case: both the original value and the tombstone are in L0.
+    #[test]
+    fn test_soft_tombstone_survives_snapshot_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_path_buf();
+
+        let key = Key::from(b"utxo_abc");
+        let value = Value::from(b"some_utxo_data");
+        let tombstone = Value::from(b""); // hayate's soft tombstone
+
+        // Write value then soft-tombstone it
+        {
+            let mut tree = LsmTree::open(path.clone(), tiny_config()).unwrap();
+            tree.insert(&key, &value).unwrap();
+            tree.insert(&key, &tombstone).unwrap();
+            tree.save_snapshot("snap1", "after tombstone").unwrap();
+        }
+
+        // Restore and check the tombstone is visible (not the original value)
+        let tree = LsmTree::open_snapshot(&path, "snap1").unwrap();
+        let result = tree.get(&key).unwrap();
+        assert!(
+            result.as_ref().map(|v| v.as_ref().is_empty()).unwrap_or(false),
+            "Expected empty (tombstone) bytes after restore, got {:?}",
+            result.map(|v| v.as_ref().to_vec())
+        );
+
+        // iter() must also see the tombstone, not the original value
+        let entries: Vec<_> = tree.iter().collect();
+        let found = entries.iter().find(|(k, _)| k == &key);
+        assert!(
+            found.map(|(_, v)| v.as_ref().is_empty()).unwrap_or(true),
+            "iter() returned non-empty value for tombstoned key"
+        );
+    }
+
+    /// Critical regression test: original value compacted to L1, tombstone in L0.
+    ///
+    /// Before the fix, `save_snapshot` renumbered SSTables 1,2,3... in flat_map
+    /// order (L0 first).  This gave L0 (newer, tombstone) a *lower* renumbered
+    /// run_number than L1 (older, value), so on restore the old value won the
+    /// BTreeMap merge and the tombstone was silently dropped.
+    ///
+    /// After the fix, original run_numbers are preserved.  The L0 SSTable always
+    /// has a higher run_number than the L1 SSTable it was compacted from, so the
+    /// tombstone correctly wins.
+    #[test]
+    fn test_soft_tombstone_wins_over_compacted_value() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_path_buf();
+
+        let key = Key::from(b"utxo_xyz");
+        let value = Value::from(b"original_utxo");
+        let tombstone = Value::from(b"");
+
+        {
+            let mut tree = LsmTree::open(path.clone(), tiny_config()).unwrap();
+
+            // Step 1: insert value → flushes to L0 (low run_number)
+            tree.insert(&key, &value).unwrap();
+
+            // Step 2: compact → value moves from L0 to L1 (still low run_number)
+            tree.compact().unwrap();
+
+            // Verify value is now in L1
+            let stats = tree.get_stats().unwrap();
+            assert_eq!(stats.l0_sstables_count, 0, "expected L0 empty after compact");
+
+            // Step 3: soft-tombstone → flushes to L0 (higher run_number than L1 value)
+            tree.insert(&key, &tombstone).unwrap();
+
+            // Step 4: save snapshot — L0 has tombstone (high run_number),
+            //         L1 has original value (low run_number)
+            tree.save_snapshot("snap_with_tombstone", "tombstone in L0").unwrap();
+        }
+
+        // Step 5: restore from snapshot
+        let tree = LsmTree::open_snapshot(&path, "snap_with_tombstone").unwrap();
+
+        // The tombstone (L0, higher run_number) must win over the value (L1, lower run_number)
+        let result = tree.get(&key).unwrap();
+        assert!(
+            result.as_ref().map(|v| v.as_ref().is_empty()).unwrap_or(false),
+            "REGRESSION: compacted value resurrected tombstone after restore. \
+             Got {:?} — tombstone should have won",
+            result.map(|v| v.as_ref().to_vec())
+        );
+
+        // Confirm via iter() too
+        let entries: Vec<_> = tree.iter().collect();
+        let found = entries.iter().find(|(k, _)| k == &key);
+        assert!(
+            found.map(|(_, v)| v.as_ref().is_empty()).unwrap_or(true),
+            "iter() returned non-empty value for tombstoned key after restore"
+        );
+    }
+}
 
 // ===== Monoidal LSM Tree =====

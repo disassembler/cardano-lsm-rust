@@ -39,6 +39,12 @@ pub struct SnapshotRun {
     pub min_key: Vec<u8>,
     pub max_key: Vec<u8>,
     pub num_entries: u64,
+    /// The level this SSTable belongs to (0 = L0, 1 = L1, ...).
+    /// Preserved across save/restore so that temporal ordering via run_number
+    /// is correctly restored and tombstones are not overridden by older values.
+    /// Defaults to 0 for snapshots created before this field was added.
+    #[serde(default)]
+    pub level: u8,
 }
 
 /// A persistent snapshot on disk
@@ -76,22 +82,26 @@ impl PersistentSnapshot {
 
         std::fs::create_dir_all(&snapshot_dir)?;
 
-        // Hard-link all SSTables to snapshot directory
-        // Renumber sequentially starting from 1
+        // Hard-link all SSTables to snapshot directory.
+        // Preserve original run_numbers: they encode temporal ordering (higher = newer).
+        // Re-numbering 1,2,3... would invert the ordering between levels because
+        // save_snapshot flattens L0 first — giving the *newest* SSTables the *lowest*
+        // new numbers — causing old values to overwrite tombstones on restore.
         let mut snapshot_runs = Vec::new();
 
-        for (i, sstable) in sstables.iter().enumerate() {
-            let new_run_number = (i + 1) as u64;
+        for sstable in sstables.iter() {
+            let run_number = sstable.run_number();
 
-            // Create hard-linked copy
-            let _linked_handle = sstable.hard_link_to(&snapshot_dir, new_run_number)
+            // Create hard-linked copy under the original run_number filename
+            let _linked_handle = sstable.hard_link_to(&snapshot_dir, run_number)
                 .map_err(Error::Io)?;
 
             snapshot_runs.push(SnapshotRun {
-                run_number: new_run_number,
+                run_number,
                 min_key: sstable.min_key.as_ref().to_vec(),
                 max_key: sstable.max_key.as_ref().to_vec(),
                 num_entries: sstable.num_entries,
+                level: sstable.level,
             });
         }
 
